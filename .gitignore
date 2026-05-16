@@ -1,0 +1,6 @@
+node_modules/
+.env
+paper-state.json
+forex-state.json
+grid-state.json
+*.log

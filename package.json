@@ -1,0 +1,16 @@
+{
+  "name": "crypto-short-scanner",
+  "version": "1.0.0",
+  "description": "Scans Bybit top 24h gainers for short-sell technical signals",
+  "main": "index.js",
+  "scripts": {
+    "start": "node altcoin-paper-bot.js",
+    "dev": "node --watch altcoin-paper-bot.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "technicalindicators": "^3.1.0",
+    "yahoo-finance2": "^3.14.0"
+  }
+}
