@@ -1,6 +1,8 @@
 node_modules/
 .env
+.env.txt
 paper-state.json
 forex-state.json
 grid-state.json
+bot-state.json
 *.log
