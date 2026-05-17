@@ -35,9 +35,10 @@ const EMA_SLOW       = 50;
 const MIN_EMA_SEP    = 0.004;                // 0.4% EMA separation required
 const SWITCH_COOL_MS = 4 * 60 * 60 * 1000;  // 4H cooldown between mode switches
 const SCAN_MS        = 15 * 60 * 1000;       // scan every 15 min
-const MIN_VOL_USD    = 30_000_000;
-const MIN_CHANGE     = 2;
-const MIN_TREND_SCORE = 0.62;  // 0-1 score: consistency × separation — skip choppy coins
+const MIN_VOL_USD    = 20_000_000;  // $20M min volume (wider net)
+const MIN_CHANGE     = 1.5;         // ±1.5% min 24H move (catch earlier movers)
+const MIN_TREND_SCORE = 0.62;
+const STALE_HOURS    = 12;          // drop coin from state if no positions for 12H
 const STATE_FILE     = './paper-state.json';
 const BASE           = 'https://api.bybit.com';
 
@@ -313,13 +314,21 @@ async function processCoin(sym, candles, state, numActive) {
 
 // ── Main scan loop ────────────────────────────────────────────────────────────
 async function scan() {
-  const state     = loadState();
-  const now       = Date.now();
-  const numActive = Object.values(state).filter(s =>
-    s.positions?.length > 0 ||
-    (now - new Date(s.startedAt || 0).getTime()) < 24 * 3600 * 1000
-  ).length;
+  const state = loadState();
+  const now   = Date.now();
 
+  // ── Rotate out stale coins (no positions + idle > STALE_HOURS) ────────────
+  for (const [sym, s] of Object.entries(state)) {
+    if (s.positions?.length > 0) continue;
+    const idleMs = now - new Date(s.startedAt || 0).getTime();
+    if (idleMs > STALE_HOURS * 3600 * 1000) {
+      log(`  ~ DROP ${sym}  idle ${Math.round(idleMs/3600000)}h  closed P&L: +$${(s.closedPnl||0).toFixed(2)}`);
+      await tg(`🔄 <b>Rotated out: ${sym}</b>  (idle ${Math.round(idleMs/3600000)}h)\nClosed P&L: +$${(s.closedPnl||0).toFixed(2)}  |  Looking for better coin...`);
+      delete state[sym];
+    }
+  }
+
+  const numActive = Object.values(state).filter(s => s.positions?.length > 0).length;
   log(`── Scan  tracked:${Object.keys(state).length}  active:${numActive}/${MAX_COINS} ──`);
 
   // Process coins already in state
@@ -337,7 +346,7 @@ async function scan() {
       const tickers = await fetchTickers();
       const candidates = [];
 
-      for (const t of tickers.slice(0, 20)) {
+      for (const t of tickers.slice(0, 50)) {
         if (state[t.symbol]) continue;
         await sleep(150);
         try {
