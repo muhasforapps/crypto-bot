@@ -338,9 +338,9 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
   const now      = Date.now();
 
   // Dynamic TP: big movers (>10% 24H) get 5% TP + 1% grid, others keep 0.67% + 0.5%
-  const isBigMover = Math.abs(change24h) >= 10;
-  const tpPct      = isBigMover ? 0.05  : TP_PCT;
-  const gridStep   = isBigMover ? 0.01  : GRID_STEP;
+  const isBigMover = Math.abs(change24h) >= BIG_MOVE_PCT;
+  const tpPct      = isBigMover ? TP_BIG   : TP_PCT;
+  const gridStep   = isBigMover ? GRID_BIG : GRID_STEP;
 
   // ── Init new coin — only if trend quality score passes ───────────────────
   if (!state[sym]) {
