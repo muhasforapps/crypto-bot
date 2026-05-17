@@ -43,13 +43,8 @@ const MIN_CHANGE     = 1.5;
 const MIN_TREND_SCORE = 0.62;
 const STALE_HOURS    = 8;
 const STATE_FILE     = './paper-state.json';
-const BASE           = 'https://api.bybit.com';
-const BASE2          = 'https://api.bytick.com';  // fallback if bybit.com returns 403
-const HEADERS        = {
-  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0',
-  'Accept':          'application/json',
-  'Accept-Language': 'en-US,en;q=0.9',
-};
+const BASE           = 'https://fapi.binance.com';  // Binance futures — never blocks cloud IPs
+const HEADERS        = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace('T',' '), ...a);
@@ -233,43 +228,24 @@ function calcEMA(values, period) {
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 async function fetchTickers() {
-  let res;
-  try {
-    res = await axios.get(`${BASE}/v5/market/tickers?category=linear`, { timeout: 10000, headers: HEADERS });
-  } catch (e) {
-    if (e.response?.status === 403 || e.code === 'ECONNREFUSED') {
-      res = await axios.get(`${BASE2}/v5/market/tickers?category=linear`, { timeout: 10000, headers: HEADERS });
-    } else throw e;
-  }
-  return res.data.result.list
-    .filter(t =>
-      t.symbol.endsWith('USDT') &&
-      !t.symbol.includes('1000') &&
-      !t.symbol.includes('USDC')
-    )
+  const res = await axios.get(`${BASE}/fapi/v1/ticker/24hr`, { timeout: 10000, headers: HEADERS });
+  return res.data
+    .filter(t => t.symbol.endsWith('USDT') && !t.symbol.includes('_'))
     .map(t => ({
       symbol:    t.symbol,
-      change24h: parseFloat(t.price24hPcnt) * 100,
-      vol24h:    parseFloat(t.turnover24h),
+      change24h: parseFloat(t.priceChangePercent),
+      vol24h:    parseFloat(t.quoteVolume),
     }))
     .filter(t => t.vol24h >= MIN_VOL_USD && Math.abs(t.change24h) >= MIN_CHANGE)
     .sort((a, b) => Math.abs(b.change24h) - Math.abs(a.change24h));
 }
 
 async function fetchCandles(symbol) {
-  const url = `/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=100`;
-  let res;
-  try {
-    res = await axios.get(`${BASE}${url}`, { timeout: 10000, headers: HEADERS });
-  } catch (e) {
-    if (e.response?.status === 403 || e.code === 'ECONNREFUSED') {
-      res = await axios.get(`${BASE2}${url}`, { timeout: 10000, headers: HEADERS });
-    } else throw e;
-  }
-  if (res.data.retCode !== 0) return [];
-  return res.data.result.list
-    .map(c => ({ ts: +c[0], high: +c[2], low: +c[3], close: +c[4] }))
-    .sort((a, b) => a.ts - b.ts);
+  const res = await axios.get(
+    `${BASE}/fapi/v1/klines?symbol=${symbol}&interval=15m&limit=100`,
+    { timeout: 10000, headers: HEADERS }
+  );
+  return res.data.map(c => ({ ts: +c[0], high: +c[2], low: +c[3], close: +c[4] }));
 }
 
 // ── Trend quality score (0–1) ─────────────────────────────────────────────────
