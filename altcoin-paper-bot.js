@@ -154,6 +154,14 @@ async function pollTelegram() {
       const name   = upd.message?.from?.first_name || 'there';
       if (!text) continue;
 
+      // /chatid works in any chat — used to get group ID for TELEGRAM_STORAGE_CHAT setup
+      if (text === '/chatid') {
+        const gid   = String(upd.message?.chat?.id);
+        const gtype = upd.message?.chat?.type;
+        await tgOne(gid, `Chat ID: <code>${gid}</code>\nType: ${gtype}\n\nPaste this as <b>TELEGRAM_STORAGE_CHAT</b> in Render env vars.`);
+        continue;
+      }
+
       const users = await loadUsers();
 
       if (text === '/start' || text === 'start') {
