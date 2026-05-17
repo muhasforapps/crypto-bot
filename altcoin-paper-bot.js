@@ -52,30 +52,51 @@ const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace
 function loadState()  { try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
-// ── Users (multi-user) ────────────────────────────────────────────────────────
-// users.json is ephemeral on Render (wiped on redeploy).
-// TELEGRAM_EXTRA_USERS env var = comma-separated chat IDs that survive redeploys.
-// Owner adds friends' chat IDs there via Render dashboard → they never lose access.
-const USERS_FILE = './users.json';
+// ── Users (multi-user, persistent via Upstash Redis) ─────────────────────────
+// Upstash Redis free tier: simple HTTP REST API, survives Render redeploys.
+// Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN in Render env vars.
+// Falls back to local users.json if Upstash is not configured (local dev).
+const USERS_FILE  = './users.json';
+const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const REDIS_KEY   = 'bot_users';
 
-function loadUsers() {
-  // Start with env-var seeds (survive redeploys)
-  const seeds = [
-    process.env.TELEGRAM_CHAT_ID,
-    ...(process.env.TELEGRAM_EXTRA_USERS || '').split(',').map(s => s.trim()),
-  ].filter(Boolean);
+async function loadUsers() {
+  // Always include owner
+  const owner = process.env.TELEGRAM_CHAT_ID;
+  const base  = owner ? [owner] : [];
 
-  let saved = [];
-  try { saved = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch {}
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      const res = await axios.get(`${REDIS_URL}/get/${REDIS_KEY}`,
+        { headers: { Authorization: `Bearer ${REDIS_TOKEN}` }, timeout: 5000 });
+      const val = res.data?.result;
+      if (val) {
+        const ids = JSON.parse(val);
+        return [...new Set([...base, ...ids])];
+      }
+    } catch (e) { log(`  ! Redis read error: ${e.message}`); }
+    return base;
+  }
 
-  // Merge: seeds + anyone who /start-ed dynamically
-  const merged = [...new Set([...seeds, ...saved])];
-  return merged;
+  // Fallback: local file
+  try {
+    const ids = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    return [...new Set([...base, ...ids])];
+  } catch { return base; }
 }
 
-function saveUsers(users) {
-  // Only save dynamically registered users (env-var seeds are always re-added by loadUsers)
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users));
+async function saveUsers(users) {
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      await axios.post(`${REDIS_URL}/set/${REDIS_KEY}`,
+        JSON.stringify(users),
+        { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 5000 });
+      return;
+    } catch (e) { log(`  ! Redis write error: ${e.message}`); }
+  }
+  // Fallback: local file
+  try { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); } catch {}
 }
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
@@ -95,7 +116,7 @@ async function tgOne(chatId, msg) {
 async function tg(msg) {
   const token = process.env.TELEGRAM_TOKEN;
   if (!token) { console.log('[TG]', msg.replace(/<[^>]+>/g,'')); return; }
-  const users = loadUsers();
+  const users = await loadUsers();
   for (const id of users) { await tgOne(id, msg); await sleep(100); }
 }
 
@@ -114,26 +135,25 @@ async function pollTelegram() {
       const name   = upd.message?.from?.first_name || 'there';
       if (!text) continue;
 
-      const users = loadUsers();
+      const users = await loadUsers();
 
       if (text === '/start' || text === 'start') {
         if (!users.includes(fromId)) {
           users.push(fromId);
-          saveUsers(users);
+          await saveUsers(users);
           log(`  + New user: ${fromId} (${name})  total: ${users.length}`);
           await tgOne(fromId,
             `👋 Welcome <b>${name}</b>!\n\n` +
             `You're now registered for live paper trading signals.\n\n` +
             `📦 $200/position  |  EMA grid  |  15min scans\n` +
-            `🎯 TP: +0.67% per position\n\n` +
+            `🎯 Normal coins: TP +0.67%  |  Big movers (>10%): TP +5%\n\n` +
             `Commands:\n<b>status</b> — open positions & P&L\n<b>help</b> — all commands`
           );
-          // Notify owner
           const owner = process.env.TELEGRAM_CHAT_ID;
           if (owner && owner !== fromId)
             await tgOne(owner, `👤 New user joined: <b>${name}</b> (${fromId})  Total: ${users.length}`);
         } else {
-          await tgOne(fromId, `✅ You're already registered, ${name}! Send <b>status</b> to see open trades.`);
+          await tgOne(fromId, `✅ Already registered, ${name}! Send <b>status</b> to see open trades.`);
         }
         continue;
       }
@@ -149,8 +169,8 @@ async function pollTelegram() {
         const idx = users.indexOf(fromId);
         if (idx > -1 && fromId !== process.env.TELEGRAM_CHAT_ID) {
           users.splice(idx, 1);
-          saveUsers(users);
-          await tgOne(fromId, '👋 You have been unsubscribed. Send /start to rejoin.');
+          await saveUsers(users);
+          await tgOne(fromId, '👋 Unsubscribed. Send /start to rejoin anytime.');
         }
       }
       if (text === 'help' || text === '/help') {
@@ -501,7 +521,7 @@ async function main() {
   log(`  EMA${EMA_FAST}/${EMA_SLOW}  |  15min  |  TP:${(TP_PCT*100).toFixed(2)}%  |  min sep:${(MIN_EMA_SEP*100).toFixed(1)}%`);
   log('══════════════════════════════════════════════════');
 
-  const users = loadUsers();
+  const users = await loadUsers();
   log(`  Registered users: ${users.length}  [${users.join(', ')}]`);
   await tg(
     '🤖 <b>Altcoin Grid Bot — STARTED</b>\n\n' +
