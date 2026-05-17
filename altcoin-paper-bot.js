@@ -53,14 +53,30 @@ function loadState()  { try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
 // ── Users (multi-user) ────────────────────────────────────────────────────────
+// users.json is ephemeral on Render (wiped on redeploy).
+// TELEGRAM_EXTRA_USERS env var = comma-separated chat IDs that survive redeploys.
+// Owner adds friends' chat IDs there via Render dashboard → they never lose access.
 const USERS_FILE = './users.json';
+
 function loadUsers() {
-  try { return JSON.parse(fs.readFileSync(USERS_FILE,'utf8')); } catch {}
-  // Seed with owner chat ID from env
-  const owner = process.env.TELEGRAM_CHAT_ID;
-  return owner ? [owner] : [];
+  // Start with env-var seeds (survive redeploys)
+  const seeds = [
+    process.env.TELEGRAM_CHAT_ID,
+    ...(process.env.TELEGRAM_EXTRA_USERS || '').split(',').map(s => s.trim()),
+  ].filter(Boolean);
+
+  let saved = [];
+  try { saved = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch {}
+
+  // Merge: seeds + anyone who /start-ed dynamically
+  const merged = [...new Set([...seeds, ...saved])];
+  return merged;
 }
-function saveUsers(users) { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); }
+
+function saveUsers(users) {
+  // Only save dynamically registered users (env-var seeds are always re-added by loadUsers)
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users));
+}
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
 let tgOffset = 0;
@@ -485,14 +501,15 @@ async function main() {
   log(`  EMA${EMA_FAST}/${EMA_SLOW}  |  15min  |  TP:${(TP_PCT*100).toFixed(2)}%  |  min sep:${(MIN_EMA_SEP*100).toFixed(1)}%`);
   log('══════════════════════════════════════════════════');
 
+  const users = loadUsers();
+  log(`  Registered users: ${users.length}  [${users.join(', ')}]`);
   await tg(
-    '🤖 <b>Altcoin SHORT-ONLY Trader — STARTED</b>\n\n' +
-    `📦 $${TRADE_SIZE} per position (paper money)\n` +
-    `📊 EMA${EMA_FAST}/${EMA_SLOW} — SHORT entries only (fade the pump)\n` +
-    `🎯 TP: −${(TP_PCT*100).toFixed(0)}% per position  (~+$${(TRADE_SIZE*TP_PCT).toFixed(0)}/pos)\n` +
-    `⏱ Max hold: ${MAX_HOLD_HOURS}H then force-close at market\n` +
-    `🔍 Scans every 15min  |  Max ${MAX_COINS} coins  |  Max ${MAX_POSITIONS} pos/coin\n\n` +
-    `Commands: <b>status</b> → open trades & P&L\n<b>help</b> → all commands`
+    '🤖 <b>Altcoin Grid Bot — STARTED</b>\n\n' +
+    `📦 $${TRADE_SIZE}/position  |  EMA${EMA_FAST}/${EMA_SLOW} grid  |  15min scans\n` +
+    `🎯 Normal coins: TP +0.67%  |  Big movers (>10% 24H): TP +5%\n` +
+    `🔍 Max ${MAX_COINS} coins  |  Max ${MAX_POSITIONS} pos/coin\n\n` +
+    `Commands: <b>status</b> → open trades & P&L\n<b>help</b> → all commands\n\n` +
+    `<i>If you stopped receiving signals, send /start to re-register.</i>`
   );
 
   // Telegram polling background loop
