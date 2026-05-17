@@ -26,19 +26,22 @@ http.createServer((req, res) => {
 // ── Config ────────────────────────────────────────────────────────────────────
 const TRADE_SIZE     = 200;
 const MAX_POSITIONS  = 4;
-const MAX_COINS      = 6;           // track up to 6 coins — more room for new movers
+const MAX_COINS      = 6;
 const CYCLE_GAP      = 0.02;
-const TP_PCT         = CYCLE_GAP / 3;        // 0.67% TP
-const GRID_STEP      = 0.005;                // 0.5% min gap between entries
+const TP_PCT         = CYCLE_GAP / 3;   // 0.67% default TP
+const GRID_STEP      = 0.005;           // 0.5% default grid step
+const BIG_MOVE_PCT   = 10;              // if |24H change| > 10% → use wider TP
+const TP_BIG         = 0.05;            // 5% TP for big movers
+const GRID_BIG       = 0.01;            // 1% grid step for big movers
 const EMA_FAST       = 20;
 const EMA_SLOW       = 50;
-const MIN_EMA_SEP    = 0.004;                // 0.4% EMA separation required
-const SWITCH_COOL_MS = 4 * 60 * 60 * 1000;  // 4H cooldown between mode switches
-const SCAN_MS        = 15 * 60 * 1000;       // scan every 15 min
-const MIN_VOL_USD    = 20_000_000;  // $20M min volume (wider net)
-const MIN_CHANGE     = 1.5;         // ±1.5% min 24H move (catch earlier movers)
+const MIN_EMA_SEP    = 0.004;
+const SWITCH_COOL_MS = 4 * 60 * 60 * 1000;
+const SCAN_MS        = 15 * 60 * 1000;
+const MIN_VOL_USD    = 20_000_000;
+const MIN_CHANGE     = 1.5;
 const MIN_TREND_SCORE = 0.62;
-const STALE_HOURS    = 8;           // drop idle coin (no positions) after 8H of inactivity
+const STALE_HOURS    = 8;
 const STATE_FILE     = './paper-state.json';
 const BASE           = 'https://api.bybit.com';
 
@@ -261,7 +264,7 @@ async function sendStatus(replyTo) {
 }
 
 // ── Process one coin ──────────────────────────────────────────────────────────
-async function processCoin(sym, candles, state, numActive) {
+async function processCoin(sym, candles, state, numActive, change24h = 0) {
   if (candles.length < EMA_SLOW + 5) return;
 
   const closes   = candles.map(c => c.close);
@@ -274,9 +277,19 @@ async function processCoin(sym, candles, state, numActive) {
   const emaSep   = Math.abs(e20 - e50) / e50;
   const now      = Date.now();
 
+  // Dynamic TP: big movers (>10% 24H) get 5% TP + 1% grid, others keep 0.67% + 0.5%
+  const isBigMover = Math.abs(change24h) >= 10;
+  const tpPct      = isBigMover ? 0.05  : TP_PCT;
+  const gridStep   = isBigMover ? 0.01  : GRID_STEP;
+
   // ── Init new coin — only if trend quality score passes ───────────────────
   if (!state[sym]) {
     if (numActive >= MAX_COINS) return;
+    // SHORTS_ONLY: only add coin if it is already in a downtrend
+    if (SHORTS_ONLY && newMode !== 'short') {
+      log(`  ~ SKIP ${sym}  waiting for SHORT (currently ${newMode})`);
+      return;
+    }
     const score = calcTrendScore(candles);
     if (score < MIN_TREND_SCORE) {
       log(`  ~ SKIP ${sym}  trend score: ${score.toFixed(2)} < ${MIN_TREND_SCORE}`);
@@ -288,12 +301,15 @@ async function processCoin(sym, candles, state, numActive) {
       startedAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
       trendScore: +score.toFixed(2),
+      change24h: +change24h.toFixed(2),
     };
-    log(`  + New coin: ${sym}  ${newMode}  score:${score.toFixed(2)}  EMA sep: ${(emaSep*100).toFixed(2)}%`);
+    const modeTag = isBigMover ? `${newMode.toUpperCase()} 🔥 BIG MOVER` : newMode.toUpperCase();
+    log(`  + New coin: ${sym}  ${modeTag}  score:${score.toFixed(2)}  24H:${change24h.toFixed(1)}%  TP:${(tpPct*100).toFixed(2)}%`);
     await tg(
       `📡 <b>New coin tracked: ${sym}</b>\n` +
-      `Direction: <b>${newMode.toUpperCase()}</b>\n` +
-      `Trend score: ${(score*100).toFixed(0)}/100  |  EMA sep: ${(emaSep*100).toFixed(2)}%\n` +
+      `Direction: <b>${newMode.toUpperCase()}</b>${isBigMover ? '  🔥 Big mover!' : ''}\n` +
+      `24H change: ${change24h>=0?'+':''}${change24h.toFixed(1)}%  |  Trend score: ${(score*100).toFixed(0)}/100\n` +
+      `🎯 TP: ${(tpPct*100).toFixed(2)}%  |  Grid: ${(gridStep*100).toFixed(1)}%\n` +
       `$${TRADE_SIZE}/position  max ${MAX_POSITIONS} positions\n<i>Paper trade</i>`
     );
   }
@@ -302,9 +318,8 @@ async function processCoin(sym, candles, state, numActive) {
 
   // ── Check TPs ─────────────────────────────────────────────────────────────
   for (let pi = s.positions.length - 1; pi >= 0; pi--) {
-    const pos  = s.positions[pi];
-    const hit  = pos.mode === 'long'  ? last.high >= pos.tp
-               : pos.mode === 'short' ? last.low  <= pos.tp : false;
+    const pos = s.positions[pi];
+    const hit = pos.mode === 'long' ? last.high >= pos.tp : last.low <= pos.tp;
     if (!hit) continue;
 
     const pnl = pos.mode === 'long'
@@ -357,21 +372,22 @@ async function processCoin(sym, candles, state, numActive) {
   if (emaSep >= MIN_EMA_SEP && s.positions.length < MAX_POSITIONS) {
     const lastEntry = s.positions.length > 0 ? s.positions[s.positions.length - 1].entry : null;
     const dist = lastEntry ? Math.abs(last.close - lastEntry) / lastEntry : 1;
-    if (dist >= GRID_STEP) {
+    if (dist >= gridStep) {
       const dec = last.close < 0.01 ? 6 : last.close < 1 ? 5 : last.close < 100 ? 4 : 2;
       const tp  = s.mode === 'long'
-        ? +(last.close * (1 + TP_PCT)).toFixed(dec)
-        : +(last.close * (1 - TP_PCT)).toFixed(dec);
+        ? +(last.close * (1 + tpPct)).toFixed(dec)
+        : +(last.close * (1 - tpPct)).toFixed(dec);
 
       s.positions.push({ entry: last.close, tp, mode: s.mode, openedAt: new Date().toISOString() });
       s.lastActivityAt = new Date().toISOString();
 
       const emoji = s.mode === 'long' ? '🟢' : '🔴';
-      log(`  ${emoji} OPEN ${sym}  ${s.mode}  entry:${last.close}  tp:${tp}`);
+      const bigTag = isBigMover ? ' 🔥' : '';
+      log(`  ${emoji} OPEN ${sym}  ${s.mode}  entry:${last.close}  tp:${tp}  (${(tpPct*100).toFixed(2)}%${isBigMover?' BIG':''})`);
       await tg(
-        `${emoji} <b>${s.mode.toUpperCase()} — ${sym}</b>\n` +
+        `${emoji} <b>${s.mode.toUpperCase()} — ${sym}</b>${bigTag}\n` +
         `📍 Entry: <code>${last.close}</code>\n` +
-        `🎯 TP:    <code>${tp}</code>  (est. +$${(TRADE_SIZE * TP_PCT).toFixed(2)})\n` +
+        `🎯 TP:    <code>${tp}</code>  (+${(tpPct*100).toFixed(2)}%  est. +$${(TRADE_SIZE * tpPct).toFixed(2)})\n` +
         `📦 $${TRADE_SIZE} paper  |  Pos: ${s.positions.length}/${MAX_POSITIONS}\n` +
         `📊 EMA sep: ${(emaSep*100).toFixed(2)}%  |  Closed so far: +$${s.closedPnl.toFixed(2)}`
       );
@@ -400,11 +416,12 @@ async function scan() {
   const numTracked = Object.keys(state).length;
   log(`── Scan  tracked:${numTracked}  active-pos:${numActive}  slots:${MAX_COINS} ──`);
 
-  // Process coins already in state
+  // Process coins already in state (change24h not available for existing coins — use 0)
   for (const sym of Object.keys(state)) {
     try {
       const candles = await fetchCandles(sym);
-      await processCoin(sym, candles, state, numActive);
+      const savedChange = state[sym]?.change24h || 0;
+      await processCoin(sym, candles, state, numActive, savedChange);
     } catch (e) { log(`  ! ${sym}: ${e.message}`); }
     await sleep(400);
   }
@@ -433,8 +450,7 @@ async function scan() {
       const liveTracked = Object.keys(state).length;
 
       if (liveTracked < MAX_COINS) {
-        // Open slot — just add it (processCoin will apply trend-score gate)
-        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length);
+        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length, t.change24h);
         continue;
       }
 
@@ -450,7 +466,7 @@ async function scan() {
         log(`  ↕ Rotate: drop ${weakSym}(score:${(weakS.trendScore||0).toFixed(2)}) → add ${t.symbol}(score:${score.toFixed(2)})`);
         await tg(`↕ <b>Rotation</b>: dropped ${weakSym} → scanning <b>${t.symbol}</b>\n(better trend score: ${(score*100).toFixed(0)} vs ${((weakS.trendScore||0)*100).toFixed(0)})\nClosed P&L ${weakSym}: +$${(weakS.closedPnl||0).toFixed(2)}`);
         delete state[weakSym];
-        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length);
+        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length, t.change24h);
       }
     }
   } catch (e) { log(`  ! ticker scan: ${e.message}`); }
@@ -470,12 +486,12 @@ async function main() {
   log('══════════════════════════════════════════════════');
 
   await tg(
-    '🤖 <b>Altcoin Grid Paper Trader — STARTED</b>\n\n' +
+    '🤖 <b>Altcoin SHORT-ONLY Trader — STARTED</b>\n\n' +
     `📦 $${TRADE_SIZE} per position (paper money)\n` +
-    `📊 EMA${EMA_FAST}/${EMA_SLOW} directional grid  |  15min candles\n` +
-    `🎯 TP: +${(TP_PCT*100).toFixed(2)}% per position\n` +
-    `🔍 Scans every 15min  |  Max ${MAX_COINS} coins  |  Max ${MAX_POSITIONS} pos/coin\n` +
-    `✅ Trend filter: EMA sep > ${(MIN_EMA_SEP*100).toFixed(1)}%  (no choppy coins)\n\n` +
+    `📊 EMA${EMA_FAST}/${EMA_SLOW} — SHORT entries only (fade the pump)\n` +
+    `🎯 TP: −${(TP_PCT*100).toFixed(0)}% per position  (~+$${(TRADE_SIZE*TP_PCT).toFixed(0)}/pos)\n` +
+    `⏱ Max hold: ${MAX_HOLD_HOURS}H then force-close at market\n` +
+    `🔍 Scans every 15min  |  Max ${MAX_COINS} coins  |  Max ${MAX_POSITIONS} pos/coin\n\n` +
     `Commands: <b>status</b> → open trades & P&L\n<b>help</b> → all commands`
   );
 
