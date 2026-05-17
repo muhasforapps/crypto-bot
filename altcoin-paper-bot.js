@@ -26,7 +26,7 @@ http.createServer((req, res) => {
 // ── Config ────────────────────────────────────────────────────────────────────
 const TRADE_SIZE     = 200;
 const MAX_POSITIONS  = 4;
-const MAX_COINS      = 3;
+const MAX_COINS      = 6;           // track up to 6 coins — more room for new movers
 const CYCLE_GAP      = 0.02;
 const TP_PCT         = CYCLE_GAP / 3;        // 0.67% TP
 const GRID_STEP      = 0.005;                // 0.5% min gap between entries
@@ -38,7 +38,7 @@ const SCAN_MS        = 15 * 60 * 1000;       // scan every 15 min
 const MIN_VOL_USD    = 20_000_000;  // $20M min volume (wider net)
 const MIN_CHANGE     = 1.5;         // ±1.5% min 24H move (catch earlier movers)
 const MIN_TREND_SCORE = 0.62;
-const STALE_HOURS    = 12;          // drop coin from state if no positions for 12H
+const STALE_HOURS    = 8;           // drop idle coin (no positions) after 8H of inactivity
 const STATE_FILE     = './paper-state.json';
 const BASE           = 'https://api.bybit.com';
 
@@ -284,7 +284,9 @@ async function processCoin(sym, candles, state, numActive) {
     }
     state[sym] = {
       mode: newMode, positions: [], closedPnl: 0,
-      trades: 0, wins: 0, lastSwitch: 0, startedAt: new Date().toISOString(),
+      trades: 0, wins: 0, lastSwitch: 0,
+      startedAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
       trendScore: +score.toFixed(2),
     };
     log(`  + New coin: ${sym}  ${newMode}  score:${score.toFixed(2)}  EMA sep: ${(emaSep*100).toFixed(2)}%`);
@@ -313,6 +315,7 @@ async function processCoin(sym, candles, state, numActive) {
     s.trades++;
     s.wins++;
     s.positions.splice(pi, 1);
+    s.lastActivityAt = new Date().toISOString();
 
     log(`  ✅ TP  ${sym}  ${pos.mode}  entry:${pos.entry}  tp:${pos.tp}  +$${pnl.toFixed(2)}`);
     await tg(
@@ -361,6 +364,7 @@ async function processCoin(sym, candles, state, numActive) {
         : +(last.close * (1 - TP_PCT)).toFixed(dec);
 
       s.positions.push({ entry: last.close, tp, mode: s.mode, openedAt: new Date().toISOString() });
+      s.lastActivityAt = new Date().toISOString();
 
       const emoji = s.mode === 'long' ? '🟢' : '🔴';
       log(`  ${emoji} OPEN ${sym}  ${s.mode}  entry:${last.close}  tp:${tp}`);
@@ -380,19 +384,21 @@ async function scan() {
   const state = loadState();
   const now   = Date.now();
 
-  // ── Rotate out stale coins (no positions + idle > STALE_HOURS) ────────────
+  // ── Rotate out stale coins (no positions + no activity for STALE_HOURS) ───
   for (const [sym, s] of Object.entries(state)) {
     if (s.positions?.length > 0) continue;
-    const idleMs = now - new Date(s.startedAt || 0).getTime();
+    const ref    = s.lastActivityAt || s.startedAt || 0;
+    const idleMs = now - new Date(ref).getTime();
     if (idleMs > STALE_HOURS * 3600 * 1000) {
       log(`  ~ DROP ${sym}  idle ${Math.round(idleMs/3600000)}h  closed P&L: +$${(s.closedPnl||0).toFixed(2)}`);
-      await tg(`🔄 <b>Rotated out: ${sym}</b>  (idle ${Math.round(idleMs/3600000)}h)\nClosed P&L: +$${(s.closedPnl||0).toFixed(2)}  |  Looking for better coin...`);
+      await tg(`🔄 <b>Rotated out: ${sym}</b>  (idle ${Math.round(idleMs/3600000)}h)\nClosed P&L: +$${(s.closedPnl||0).toFixed(2)}  |  Slot freed for new mover...`);
       delete state[sym];
     }
   }
 
   const numActive = Object.values(state).filter(s => s.positions?.length > 0).length;
-  log(`── Scan  tracked:${Object.keys(state).length}  active:${numActive}/${MAX_COINS} ──`);
+  const numTracked = Object.keys(state).length;
+  log(`── Scan  tracked:${numTracked}  active-pos:${numActive}  slots:${MAX_COINS} ──`);
 
   // Process coins already in state
   for (const sym of Object.keys(state)) {
@@ -403,33 +409,51 @@ async function scan() {
     await sleep(400);
   }
 
-  // Look for new trending coins if we have room — score all candidates first
-  if (numActive < MAX_COINS) {
-    try {
-      const tickers = await fetchTickers();
-      const candidates = [];
+  // Always scan for new movers — fill open slots or rotate weakest idle coin
+  try {
+    const tickers    = await fetchTickers();
+    const candidates = [];
 
-      for (const t of tickers.slice(0, 50)) {
-        if (state[t.symbol]) continue;
-        await sleep(150);
-        try {
-          const candles = await fetchCandles(t.symbol);
-          if (candles.length < EMA_SLOW + 10) continue;
-          const score = calcTrendScore(candles);
-          candidates.push({ t, candles, score });
-        } catch (_) {}
+    for (const t of tickers.slice(0, 50)) {
+      if (state[t.symbol]) continue;
+      await sleep(150);
+      try {
+        const candles = await fetchCandles(t.symbol);
+        if (candles.length < EMA_SLOW + 10) continue;
+        const score = calcTrendScore(candles);
+        candidates.push({ t, candles, score });
+      } catch (_) {}
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates.length)
+      log(`  Candidates: ${candidates.slice(0,8).map(c => `${c.t.symbol}(${c.score.toFixed(2)})`).join(' ')}`);
+
+    for (const { t, candles, score } of candidates) {
+      const liveTracked = Object.keys(state).length;
+
+      if (liveTracked < MAX_COINS) {
+        // Open slot — just add it (processCoin will apply trend-score gate)
+        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length);
+        continue;
       }
 
-      // Sort by trend score descending — best trending coins get the slots first
-      candidates.sort((a, b) => b.score - a.score);
-      log(`  Candidates ranked: ${candidates.map(c => `${c.t.symbol}(${c.score.toFixed(2)})`).join(' ')}`);
+      // All slots full — rotate out weakest idle coin if new one is meaningfully better
+      const idleCoins = Object.entries(state)
+        .filter(([, s]) => !s.positions?.length)
+        .sort((a, b) => (a[1].trendScore || 0) - (b[1].trendScore || 0));
 
-      for (const { t, candles } of candidates) {
-        if (Object.values(state).filter(s => s.positions?.length > 0).length >= MAX_COINS) break;
-        await processCoin(t.symbol, candles, state, numActive);
+      if (!idleCoins.length) break;  // every slot has open positions — can't rotate
+
+      const [weakSym, weakS] = idleCoins[0];
+      if (score > (weakS.trendScore || 0) + 0.08) {
+        log(`  ↕ Rotate: drop ${weakSym}(score:${(weakS.trendScore||0).toFixed(2)}) → add ${t.symbol}(score:${score.toFixed(2)})`);
+        await tg(`↕ <b>Rotation</b>: dropped ${weakSym} → scanning <b>${t.symbol}</b>\n(better trend score: ${(score*100).toFixed(0)} vs ${((weakS.trendScore||0)*100).toFixed(0)})\nClosed P&L ${weakSym}: +$${(weakS.closedPnl||0).toFixed(2)}`);
+        delete state[weakSym];
+        await processCoin(t.symbol, candles, state, Object.values(state).filter(s => s.positions?.length > 0).length);
       }
-    } catch (e) { log(`  ! ticker scan: ${e.message}`); }
-  }
+    }
+  } catch (e) { log(`  ! ticker scan: ${e.message}`); }
 
   saveState(state);
 
