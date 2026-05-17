@@ -37,6 +37,7 @@ const SWITCH_COOL_MS = 4 * 60 * 60 * 1000;  // 4H cooldown between mode switches
 const SCAN_MS        = 15 * 60 * 1000;       // scan every 15 min
 const MIN_VOL_USD    = 30_000_000;
 const MIN_CHANGE     = 2;
+const MIN_TREND_SCORE = 0.62;  // 0-1 score: consistency × separation — skip choppy coins
 const STATE_FILE     = './paper-state.json';
 const BASE           = 'https://api.bybit.com';
 
@@ -124,6 +125,29 @@ async function fetchCandles(symbol) {
     .sort((a, b) => a.ts - b.ts);
 }
 
+// ── Trend quality score (0–1) ─────────────────────────────────────────────────
+// Combines EMA consistency (% of candles clearly trending) + current separation
+// High score = strong clean trend → good for grid
+// Low score  = choppy, EMA crossing frequently → skip
+function calcTrendScore(candles) {
+  if (candles.length < EMA_SLOW + 10) return 0;
+  const closes = candles.map(c => c.close);
+  const ema20  = calcEMA(closes, EMA_FAST);
+  const ema50  = calcEMA(closes, EMA_SLOW);
+
+  let consistent = 0;
+  const from = EMA_SLOW;
+  for (let i = from; i < candles.length; i++) {
+    if (Math.abs(ema20[i] - ema50[i]) / ema50[i] >= MIN_EMA_SEP) consistent++;
+  }
+  const consistency = consistent / (candles.length - from);  // 0–1
+
+  const curSep = Math.abs(ema20[ema20.length - 1] - ema50[ema50.length - 1]) / ema50[ema50.length - 1];
+  const sepScore = Math.min(curSep / 0.02, 1);               // 0–1, caps at 2% sep
+
+  return consistency * 0.6 + sepScore * 0.4;
+}
+
 // ── Status report ─────────────────────────────────────────────────────────────
 async function sendStatus() {
   const state  = loadState();
@@ -186,18 +210,24 @@ async function processCoin(sym, candles, state, numActive) {
   const emaSep   = Math.abs(e20 - e50) / e50;
   const now      = Date.now();
 
-  // ── Init new coin ─────────────────────────────────────────────────────────
+  // ── Init new coin — only if trend quality score passes ───────────────────
   if (!state[sym]) {
-    if (numActive >= MAX_COINS || emaSep < MIN_EMA_SEP) return;
+    if (numActive >= MAX_COINS) return;
+    const score = calcTrendScore(candles);
+    if (score < MIN_TREND_SCORE) {
+      log(`  ~ SKIP ${sym}  trend score: ${score.toFixed(2)} < ${MIN_TREND_SCORE}`);
+      return;
+    }
     state[sym] = {
       mode: newMode, positions: [], closedPnl: 0,
       trades: 0, wins: 0, lastSwitch: 0, startedAt: new Date().toISOString(),
+      trendScore: +score.toFixed(2),
     };
-    log(`  + New coin: ${sym}  ${newMode}  EMA sep: ${(emaSep*100).toFixed(2)}%`);
+    log(`  + New coin: ${sym}  ${newMode}  score:${score.toFixed(2)}  EMA sep: ${(emaSep*100).toFixed(2)}%`);
     await tg(
       `📡 <b>New coin tracked: ${sym}</b>\n` +
       `Direction: <b>${newMode.toUpperCase()}</b>\n` +
-      `EMA sep: ${(emaSep*100).toFixed(2)}%  |  Vol filter: ✅\n` +
+      `Trend score: ${(score*100).toFixed(0)}/100  |  EMA sep: ${(emaSep*100).toFixed(2)}%\n` +
       `$${TRADE_SIZE}/position  max ${MAX_POSITIONS} positions\n<i>Paper trade</i>`
     );
   }
@@ -301,17 +331,30 @@ async function scan() {
     await sleep(400);
   }
 
-  // Look for new trending coins if we have room
+  // Look for new trending coins if we have room — score all candidates first
   if (numActive < MAX_COINS) {
     try {
       const tickers = await fetchTickers();
-      for (const t of tickers.slice(0, 15)) {
+      const candidates = [];
+
+      for (const t of tickers.slice(0, 20)) {
         if (state[t.symbol]) continue;
-        await sleep(200);
+        await sleep(150);
         try {
           const candles = await fetchCandles(t.symbol);
-          await processCoin(t.symbol, candles, state, numActive);
-        } catch (e) { log(`  ! ${t.symbol}: ${e.message}`); }
+          if (candles.length < EMA_SLOW + 10) continue;
+          const score = calcTrendScore(candles);
+          candidates.push({ t, candles, score });
+        } catch (_) {}
+      }
+
+      // Sort by trend score descending — best trending coins get the slots first
+      candidates.sort((a, b) => b.score - a.score);
+      log(`  Candidates ranked: ${candidates.map(c => `${c.t.symbol}(${c.score.toFixed(2)})`).join(' ')}`);
+
+      for (const { t, candles } of candidates) {
+        if (Object.values(state).filter(s => s.positions?.length > 0).length >= MAX_COINS) break;
+        await processCoin(t.symbol, candles, state, numActive);
       }
     } catch (e) { log(`  ! ticker scan: ${e.message}`); }
   }
