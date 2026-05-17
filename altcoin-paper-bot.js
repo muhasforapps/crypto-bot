@@ -49,36 +49,98 @@ const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace
 function loadState()  { try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
+// ── Users (multi-user) ────────────────────────────────────────────────────────
+const USERS_FILE = './users.json';
+function loadUsers() {
+  try { return JSON.parse(fs.readFileSync(USERS_FILE,'utf8')); } catch {}
+  // Seed with owner chat ID from env
+  const owner = process.env.TELEGRAM_CHAT_ID;
+  return owner ? [owner] : [];
+}
+function saveUsers(users) { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); }
+
 // ── Telegram ──────────────────────────────────────────────────────────────────
 let tgOffset = 0;
 
-async function tg(msg) {
-  const token  = process.env.TELEGRAM_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) { console.log('[TG]', msg.replace(/<[^>]+>/g,'')); return; }
+// Send to one specific chat
+async function tgOne(chatId, msg) {
+  const token = process.env.TELEGRAM_TOKEN;
+  if (!token) return;
   try {
     await axios.post(`https://api.telegram.org/bot${token}/sendMessage`,
       { chat_id: chatId, text: msg, parse_mode: 'HTML' }, { timeout: 8000 });
   } catch (_) {}
 }
 
+// Broadcast to all registered users
+async function tg(msg) {
+  const token = process.env.TELEGRAM_TOKEN;
+  if (!token) { console.log('[TG]', msg.replace(/<[^>]+>/g,'')); return; }
+  const users = loadUsers();
+  for (const id of users) { await tgOne(id, msg); await sleep(100); }
+}
+
 async function pollTelegram() {
-  const token  = process.env.TELEGRAM_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
+  const token = process.env.TELEGRAM_TOKEN;
+  if (!token) return;
   try {
     const res = await axios.get(
       `https://api.telegram.org/bot${token}/getUpdates?offset=${tgOffset}&timeout=2`,
       { timeout: 6000 });
+
     for (const upd of res.data.result || []) {
       tgOffset = upd.update_id + 1;
       const text   = upd.message?.text?.trim().toLowerCase();
       const fromId = String(upd.message?.chat?.id);
-      if (fromId !== chatId) continue;
-      if (text === 'status' || text === 'p&l') await sendStatus();
-      if (text === 'help') await tg(
-        'Commands:\n<b>status</b> — open positions & P&L\n<b>help</b> — this message'
-      );
+      const name   = upd.message?.from?.first_name || 'there';
+      if (!text) continue;
+
+      const users = loadUsers();
+
+      if (text === '/start' || text === 'start') {
+        if (!users.includes(fromId)) {
+          users.push(fromId);
+          saveUsers(users);
+          log(`  + New user: ${fromId} (${name})  total: ${users.length}`);
+          await tgOne(fromId,
+            `👋 Welcome <b>${name}</b>!\n\n` +
+            `You're now registered for live paper trading signals.\n\n` +
+            `📦 $200/position  |  EMA grid  |  15min scans\n` +
+            `🎯 TP: +0.67% per position\n\n` +
+            `Commands:\n<b>status</b> — open positions & P&L\n<b>help</b> — all commands`
+          );
+          // Notify owner
+          const owner = process.env.TELEGRAM_CHAT_ID;
+          if (owner && owner !== fromId)
+            await tgOne(owner, `👤 New user joined: <b>${name}</b> (${fromId})  Total: ${users.length}`);
+        } else {
+          await tgOne(fromId, `✅ You're already registered, ${name}! Send <b>status</b> to see open trades.`);
+        }
+        continue;
+      }
+
+      // Only registered users can use commands
+      if (!users.includes(fromId)) {
+        await tgOne(fromId, 'Send /start to register for signals.');
+        continue;
+      }
+
+      if (text === 'status' || text === 'p&l') await sendStatus(fromId);
+      if (text === '/stop' || text === 'stop') {
+        const idx = users.indexOf(fromId);
+        if (idx > -1 && fromId !== process.env.TELEGRAM_CHAT_ID) {
+          users.splice(idx, 1);
+          saveUsers(users);
+          await tgOne(fromId, '👋 You have been unsubscribed. Send /start to rejoin.');
+        }
+      }
+      if (text === 'help' || text === '/help') {
+        await tgOne(fromId,
+          'Commands:\n<b>status</b> — open positions & P&L\n' +
+          '<b>stop</b> — unsubscribe from signals\n' +
+          '<b>help</b> — this message'
+        );
+      }
     }
   } catch (_) {}
 }
@@ -150,12 +212,13 @@ function calcTrendScore(candles) {
 }
 
 // ── Status report ─────────────────────────────────────────────────────────────
-async function sendStatus() {
+async function sendStatus(replyTo) {
   const state  = loadState();
   const active = Object.entries(state).filter(([, v]) => v.positions?.length > 0);
   const all    = Object.entries(state);
 
-  if (!all.length) { await tg('📊 No coins being tracked yet.'); return; }
+  const send = replyTo ? (m => tgOne(replyTo, m)) : tg;
+  if (!all.length) { await send('📊 No coins being tracked yet.'); return; }
 
   let totalClosed = 0, totalOpen = 0;
   const lines = ['📊 <b>Paper Grid Status</b>  ($200/position)\n'];
@@ -194,7 +257,7 @@ async function sendStatus() {
 
   lines.push(`\n💰 <b>Total closed: ${totalClosed >= 0 ? '+' : ''}$${totalClosed.toFixed(2)}</b>`);
   lines.push(`📈 Unrealized: ${totalOpen >= 0 ? '+' : ''}$${totalOpen.toFixed(2)}`);
-  await tg(lines.join('\n'));
+  await send(lines.join('\n'));
 }
 
 // ── Process one coin ──────────────────────────────────────────────────────────
