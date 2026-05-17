@@ -43,7 +43,7 @@ const MIN_CHANGE     = 1.5;
 const MIN_TREND_SCORE = 0.62;
 const STALE_HOURS    = 8;
 const STATE_FILE     = './paper-state.json';
-const BASE           = 'https://fapi.binance.com';  // Binance futures — never blocks cloud IPs
+const BASE           = 'https://api.bybit.com';
 const HEADERS        = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -228,13 +228,13 @@ function calcEMA(values, period) {
 
 // ── Data fetching ─────────────────────────────────────────────────────────────
 async function fetchTickers() {
-  const res = await axios.get(`${BASE}/fapi/v1/ticker/24hr`, { timeout: 10000, headers: HEADERS });
-  return res.data
-    .filter(t => t.symbol.endsWith('USDT') && !t.symbol.includes('_'))
+  const res = await axios.get(`${BASE}/v5/market/tickers?category=linear`, { timeout: 10000, headers: HEADERS });
+  return res.data.result.list
+    .filter(t => t.symbol.endsWith('USDT') && !t.symbol.includes('1000') && !t.symbol.includes('USDC'))
     .map(t => ({
       symbol:    t.symbol,
-      change24h: parseFloat(t.priceChangePercent),
-      vol24h:    parseFloat(t.quoteVolume),
+      change24h: parseFloat(t.price24hPcnt) * 100,
+      vol24h:    parseFloat(t.turnover24h),
     }))
     .filter(t => t.vol24h >= MIN_VOL_USD && Math.abs(t.change24h) >= MIN_CHANGE)
     .sort((a, b) => Math.abs(b.change24h) - Math.abs(a.change24h));
@@ -242,10 +242,13 @@ async function fetchTickers() {
 
 async function fetchCandles(symbol) {
   const res = await axios.get(
-    `${BASE}/fapi/v1/klines?symbol=${symbol}&interval=15m&limit=100`,
+    `${BASE}/v5/market/kline?category=linear&symbol=${symbol}&interval=15&limit=100`,
     { timeout: 10000, headers: HEADERS }
   );
-  return res.data.map(c => ({ ts: +c[0], high: +c[2], low: +c[3], close: +c[4] }));
+  if (res.data.retCode !== 0) return [];
+  return res.data.result.list
+    .map(c => ({ ts: +c[0], high: +c[2], low: +c[3], close: +c[4] }))
+    .sort((a, b) => a.ts - b.ts);
 }
 
 // ── Trend quality score (0–1) ─────────────────────────────────────────────────
