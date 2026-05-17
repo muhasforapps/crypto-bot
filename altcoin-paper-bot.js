@@ -52,34 +52,37 @@ const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace
 function loadState()  { try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 
-// ── Users (multi-user, persistent via Upstash Redis) ─────────────────────────
-// Upstash Redis free tier: simple HTTP REST API, survives Render redeploys.
-// Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN in Render env vars.
-// Falls back to local users.json if Upstash is not configured (local dev).
-const USERS_FILE  = './users.json';
-const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL;
-const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const REDIS_KEY   = 'bot_users';
+// ── Users — stored in a pinned message in a private Telegram group ────────────
+// Setup (one time):
+//   1. Create a private Telegram group — add your bot as admin (so it can pin)
+//   2. Get the group's chat ID: forward any message from the group to @userinfobot
+//   3. Add TELEGRAM_STORAGE_CHAT=<that chat id> to Render env vars
+// On every /start the bot edits the pinned message — survives all redeploys.
+const USERS_FILE    = './users.json';
+const STORAGE_CHAT  = process.env.TELEGRAM_STORAGE_CHAT;
+let   storageMsgId  = null;   // cached message_id of the pinned storage message
 
 async function loadUsers() {
-  // Always include owner
   const owner = process.env.TELEGRAM_CHAT_ID;
   const base  = owner ? [owner] : [];
 
-  if (REDIS_URL && REDIS_TOKEN) {
+  if (STORAGE_CHAT && process.env.TELEGRAM_TOKEN) {
     try {
-      const res = await axios.get(`${REDIS_URL}/get/${REDIS_KEY}`,
-        { headers: { Authorization: `Bearer ${REDIS_TOKEN}` }, timeout: 5000 });
-      const val = res.data?.result;
-      if (val) {
-        const ids = JSON.parse(val);
+      const token = process.env.TELEGRAM_TOKEN;
+      const res   = await axios.get(
+        `https://api.telegram.org/bot${token}/getChat?chat_id=${STORAGE_CHAT}`,
+        { timeout: 5000 });
+      const pinned = res.data.result?.pinned_message;
+      if (pinned?.text) {
+        storageMsgId = pinned.message_id;
+        const ids = JSON.parse(pinned.text);
         return [...new Set([...base, ...ids])];
       }
-    } catch (e) { log(`  ! Redis read error: ${e.message}`); }
+    } catch (e) { log(`  ! TG storage read: ${e.message}`); }
     return base;
   }
 
-  // Fallback: local file
+  // Fallback: local file (local dev / no storage chat configured)
   try {
     const ids = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
     return [...new Set([...base, ...ids])];
@@ -87,14 +90,30 @@ async function loadUsers() {
 }
 
 async function saveUsers(users) {
-  if (REDIS_URL && REDIS_TOKEN) {
+  const token = process.env.TELEGRAM_TOKEN;
+
+  if (STORAGE_CHAT && token) {
     try {
-      await axios.post(`${REDIS_URL}/set/${REDIS_KEY}`,
-        JSON.stringify(users),
-        { headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' }, timeout: 5000 });
+      const payload = JSON.stringify(users);
+
+      if (storageMsgId) {
+        // Edit existing pinned message
+        await axios.post(`https://api.telegram.org/bot${token}/editMessageText`,
+          { chat_id: STORAGE_CHAT, message_id: storageMsgId, text: payload },
+          { timeout: 5000 });
+      } else {
+        // First time: send message then pin it
+        const msg = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`,
+          { chat_id: STORAGE_CHAT, text: payload }, { timeout: 5000 });
+        storageMsgId = msg.data.result.message_id;
+        await axios.post(`https://api.telegram.org/bot${token}/pinChatMessage`,
+          { chat_id: STORAGE_CHAT, message_id: storageMsgId, disable_notification: true },
+          { timeout: 5000 });
+      }
       return;
-    } catch (e) { log(`  ! Redis write error: ${e.message}`); }
+    } catch (e) { log(`  ! TG storage write: ${e.message}`); }
   }
+
   // Fallback: local file
   try { fs.writeFileSync(USERS_FILE, JSON.stringify(users)); } catch {}
 }
