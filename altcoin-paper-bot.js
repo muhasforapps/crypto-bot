@@ -345,11 +345,6 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
   // ── Init new coin — only if trend quality score passes ───────────────────
   if (!state[sym]) {
     if (numActive >= MAX_COINS) return;
-    // SHORTS_ONLY: only add coin if it is already in a downtrend
-    if (SHORTS_ONLY && newMode !== 'short') {
-      log(`  ~ SKIP ${sym}  waiting for SHORT (currently ${newMode})`);
-      return;
-    }
     const score = calcTrendScore(candles);
     if (score < MIN_TREND_SCORE) {
       log(`  ~ SKIP ${sym}  trend score: ${score.toFixed(2)} < ${MIN_TREND_SCORE}`);
