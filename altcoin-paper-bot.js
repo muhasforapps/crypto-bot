@@ -43,11 +43,30 @@ const MIN_CHANGE     = 1.5;
 const MIN_TREND_SCORE = 0.62;
 const STALE_HOURS    = 8;
 const STATE_FILE     = './paper-state.json';
+const TRADES_FILE    = './trades.csv';
 const BASE           = 'https://api.bybit.com';
 const HEADERS        = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace('T',' '), ...a);
+
+// ── Trade CSV logger ──────────────────────────────────────────────────────────
+function logTrade({ symbol, type, direction, entry, exit, pnl, coinTotalPnl }) {
+  const header = 'timestamp,symbol,type,direction,entry,exit,pnl,coin_total_pnl\n';
+  const row    = [
+    new Date().toISOString().slice(0, 19).replace('T', ' '),
+    symbol,
+    type,           // tp | switch
+    direction,      // long | short
+    entry,
+    exit,
+    pnl.toFixed(4),
+    coinTotalPnl.toFixed(4),
+  ].join(',') + '\n';
+
+  if (!fs.existsSync(TRADES_FILE)) fs.writeFileSync(TRADES_FILE, header);
+  fs.appendFileSync(TRADES_FILE, row);
+}
 
 // ── State ─────────────────────────────────────────────────────────────────────
 function loadState()  { try { return JSON.parse(fs.readFileSync(STATE_FILE,'utf8')); } catch { return {}; } }
@@ -193,6 +212,7 @@ async function pollTelegram() {
       }
 
       if (text === 'status' || text === 'p&l') await sendStatus(fromId);
+      if (text === 'trades' || text === 'log') await sendTradesSummary(fromId);
       if (text === '/stop' || text === 'stop') {
         const idx = users.indexOf(fromId);
         if (idx > -1 && fromId !== process.env.TELEGRAM_CHAT_ID) {
@@ -204,6 +224,7 @@ async function pollTelegram() {
       if (text === 'help' || text === '/help') {
         await tgOne(fromId,
           'Commands:\n<b>status</b> — open positions & P&L\n' +
+          '<b>trades</b> — all-time profit breakdown by coin\n' +
           '<b>stop</b> — unsubscribe from signals\n' +
           '<b>help</b> — this message'
         );
@@ -274,6 +295,56 @@ function calcTrendScore(candles) {
   return consistency * 0.6 + sepScore * 0.4;
 }
 
+// ── Trade log summary (from trades.csv) ───────────────────────────────────────
+async function sendTradesSummary(replyTo) {
+  if (!fs.existsSync(TRADES_FILE)) {
+    await tgOne(replyTo, '📋 No trades logged yet — trades.csv is empty.');
+    return;
+  }
+
+  const lines = fs.readFileSync(TRADES_FILE, 'utf8').trim().split('\n').slice(1); // skip header
+  if (!lines.length) { await tgOne(replyTo, '📋 No trades logged yet.'); return; }
+
+  const rows = lines.map(l => {
+    const [ts, symbol, type, direction, entry, exit, pnl, coinTotal] = l.split(',');
+    return { ts, symbol, type, direction, entry: +entry, exit: +exit, pnl: +pnl };
+  });
+
+  const total    = rows.reduce((s, r) => s + r.pnl, 0);
+  const wins     = rows.filter(r => r.pnl > 0).length;
+  const tpRows   = rows.filter(r => r.type === 'tp');
+  const swRows   = rows.filter(r => r.type === 'switch');
+  const tpPnl    = tpRows.reduce((s, r) => s + r.pnl, 0);
+  const swPnl    = swRows.reduce((s, r) => s + r.pnl, 0);
+
+  // Per-coin breakdown
+  const bySymbol = {};
+  for (const r of rows) {
+    if (!bySymbol[r.symbol]) bySymbol[r.symbol] = { pnl: 0, n: 0, wins: 0 };
+    bySymbol[r.symbol].pnl  += r.pnl;
+    bySymbol[r.symbol].n++;
+    if (r.pnl > 0) bySymbol[r.symbol].wins++;
+  }
+
+  const coinLines = Object.entries(bySymbol)
+    .sort((a, b) => b[1].pnl - a[1].pnl)
+    .map(([sym, d]) => {
+      const wr  = ((d.wins / d.n) * 100).toFixed(0);
+      const tag = d.pnl >= 0 ? '🟢' : '🔴';
+      return `${tag} ${sym.padEnd(16)} ${d.pnl >= 0 ? '+' : ''}$${d.pnl.toFixed(2).padStart(8)}  ${d.n}tr  WR:${wr}%`;
+    });
+
+  const msg =
+    `📋 <b>All-Time Trade Log</b>  (${rows.length} trades)\n\n` +
+    `💰 <b>Total P&L: ${total >= 0 ? '+' : ''}$${total.toFixed(2)}</b>\n` +
+    `✅ TP profits:    +$${tpPnl.toFixed(2)}  (${tpRows.length} trades)\n` +
+    `🔄 Switch losses:  $${swPnl.toFixed(2)}  (${swRows.length} trades)\n` +
+    `📊 Win rate: ${wins}/${rows.length}  (${(wins/rows.length*100).toFixed(0)}%)\n\n` +
+    `<b>Per coin:</b>\n<code>${coinLines.join('\n')}</code>`;
+
+  await tgOne(replyTo, msg);
+}
+
 // ── Status report ─────────────────────────────────────────────────────────────
 async function sendStatus(replyTo) {
   const state  = loadState();
@@ -299,6 +370,10 @@ async function sendStatus(replyTo) {
     try {
       const candles = await fetchCandles(sym);
       const cur = candles.length ? candles[candles.length - 1].close : 0;
+      if (!cur) {
+        lines.push(`${emoji} <b>${sym}</b>  ${s.mode.toUpperCase()}  (${s.positions.length} open)  <i>price unavailable</i>`);
+        continue;
+      }
       let coinOpen = 0;
       lines.push(`${emoji} <b>${sym}</b>  ${s.mode.toUpperCase()}  (${s.positions.length} open)`);
 
@@ -387,6 +462,7 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
     s.positions.splice(pi, 1);
     s.lastActivityAt = new Date().toISOString();
 
+    logTrade({ symbol: sym, type: 'tp', direction: pos.mode, entry: pos.entry, exit: pos.tp, pnl, coinTotalPnl: s.closedPnl });
     log(`  ✅ TP  ${sym}  ${pos.mode}  entry:${pos.entry}  tp:${pos.tp}  +$${pnl.toFixed(2)}`);
     await tg(
       `✅ <b>TP HIT — ${pos.mode.toUpperCase()} ${sym}</b>\n` +
@@ -408,6 +484,7 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
       s.closedPnl += pnl;
       s.trades++;
       if (pnl > 0) s.wins++;
+      logTrade({ symbol: sym, type: 'switch', direction: pos.mode, entry: pos.entry, exit: last.close, pnl, coinTotalPnl: s.closedPnl });
       closed.push(`${pos.mode} @${pos.entry} → ${last.close}  ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`);
     }
     s.positions  = [];

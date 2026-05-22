@@ -25,8 +25,9 @@ const MIN_CHANGE    = 2;           // ±2% 24H move minimum
 const TOP_N         = 40;          // scan top 40 movers
 
 // ── Trend-strength filters ────────────────────────────────────────────────────
-const MIN_EMA_SEP   = 0.004;  // EMA20 must be >0.4% away from EMA50 to open a position
-const SWITCH_COOL   = 16;     // candles to wait after a mode switch before switching again (16×15min = 4H)
+const MIN_EMA_SEP    = 0.004;  // EMA20 must be >0.4% away from EMA50 to open a position
+const SWITCH_MIN_SEP = 0.015;  // tested threshold — kept for comparison runs only
+const SWITCH_COOL    = 16;     // candles to wait after a mode switch before switching again (16×15min = 4H)
 const MIN_TREND_PCT = 0.55;   // skip coin if EMA is clearly separated <55% of the time (too choppy)
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -94,7 +95,8 @@ async function fetchKlines(symbol) {
 
 // ── Grid simulation ───────────────────────────────────────────────────────────
 
-function runGrid(candles, symbol) {
+function runGrid(candles, symbol, opts = {}) {
+  const switchMinSep = opts.switchMinSep ?? 0;
   if (candles.length < EMA_SLOW + 20) return null;
 
   const closes = candles.map(c => c.close);
@@ -127,8 +129,8 @@ function runGrid(candles, symbol) {
     const date    = new Date(c.ts).toISOString().slice(0, 10);
     const emaSep  = Math.abs(ema20[i] - ema50[i]) / ema50[i];
 
-    // ── Mode switch: only if cooldown passed ──────────────────────────────
-    if (mode && newMode !== mode && (i - lastSwitch) >= SWITCH_COOL) {
+    // ── Mode switch: only if cooldown passed and EMA separation is strong ────
+    if (mode && newMode !== mode && emaSep >= switchMinSep && (i - lastSwitch) >= SWITCH_COOL) {
       for (const pos of positions) {
         const pnl = pos.mode === 'long'
           ? (c.close - pos.entry) / pos.entry * TRADE_SIZE
@@ -224,10 +226,11 @@ async function main() {
   }
 
   console.log('\nFetching 15min candles & running EMA grid...\n');
-  console.log('  Symbol         Mode   Trades  WR%   ClosedP&L   OpenP&L    Total');
-  console.log('  ──────────────────────────────────────────────────────────────────');
+  console.log('  Symbol         Mode   Trades  WR%   ClosedP&L   OpenP&L    Total     │ +SwitchFilter  Total');
+  console.log('  ──────────────────────────────────────────────────────────────────────────────────────────────');
 
-  const results = [];
+  const results    = [];   // baseline (no switch filter)
+  const resultsNew = [];   // with SWITCH_MIN_SEP=1.5%
 
   for (const t of tickers) {
     await sleep(150);
@@ -237,22 +240,31 @@ async function main() {
         console.log(`  ${t.symbol.padEnd(14)} — not enough data`);
         continue;
       }
-      const r = runGrid(candles, t.symbol);
-      if (!r) continue;
+      const r    = runGrid(candles, t.symbol);
+      const rNew = runGrid(candles, t.symbol, { switchMinSep: SWITCH_MIN_SEP });
+      if (!r || !rNew) continue;
 
       if (r.skipped) {
         console.log(`  ${r.symbol.padEnd(14)} SKIP  (choppy — trend only ${(r.trendPct*100).toFixed(0)}% of time)`);
         continue;
       }
       results.push({ ...r, change24h: t.change24h });
-      const flag = r.total > 5 ? ' ✅' : r.total < -5 ? ' ❌' : '  ';
+      resultsNew.push({ ...rNew, change24h: t.change24h });
+
+      const flag    = r.total    > 5 ? ' ✅' : r.total    < -5 ? ' ❌' : '  ';
+      const flagNew = rNew.total > 5 ? ' ✅' : rNew.total < -5 ? ' ❌' : '  ';
+      const diff    = rNew.total - r.total;
+      const diffStr = (diff >= 0 ? '+' : '') + '$' + diff.toFixed(1);
       console.log(
         `  ${r.symbol.padEnd(14)} ${(r.mode ?? '?').padEnd(6)} ` +
         `${String(r.n).padStart(5)}tr  ` +
         `${(r.wr + '%').padStart(5)}  ` +
         `${r.closedPnl >= 0 ? '+' : ''}$${r.closedPnl.toFixed(1).padStart(7)}  ` +
         `${r.openPnl >= 0 ? '+' : ''}$${r.openPnl.toFixed(1).padStart(7)}  ` +
-        `${r.total >= 0 ? '+' : ''}$${r.total.toFixed(1).padStart(7)}${flag}`
+        `${r.total >= 0 ? '+' : ''}$${r.total.toFixed(1).padStart(7)}${flag}` +
+        `  │ ${String(rNew.n).padStart(4)}tr  ` +
+        `${rNew.total >= 0 ? '+' : ''}$${rNew.total.toFixed(1).padStart(7)}${flagNew}` +
+        `  (${diffStr})`
       );
     } catch (e) {
       console.log(`  ${t.symbol.padEnd(14)} ERR: ${e.message}`);
@@ -262,12 +274,14 @@ async function main() {
   if (!results.length) { console.log('\nNo results.'); return; }
 
   results.sort((a, b) => b.total - a.total);
+  resultsNew.sort((a, b) => b.total - a.total);
 
-  const winners   = results.filter(r => r.total > 0);
-  const losers    = results.filter(r => r.total <= 0);
-  const totalAll  = results.reduce((s, r) => s + r.total, 0);
-  const totalWin  = winners.reduce((s, r) => s + r.total, 0);
-  // DAYS is the test window — treat as the monthly result directly
+  const winners    = results.filter(r => r.total > 0);
+  const losers     = results.filter(r => r.total <= 0);
+  const totalAll   = results.reduce((s, r) => s + r.total, 0);
+  const totalWin   = winners.reduce((s, r) => s + r.total, 0);
+  const totalNew   = resultsNew.reduce((s, r) => s + r.total, 0);
+  const winnersNew = resultsNew.filter(r => r.total > 0);
   const monthlyAll = totalAll;
 
   console.log(`\n${'═'.repeat(70)}`);
@@ -316,9 +330,11 @@ async function main() {
   }
 
   console.log(`\n  STATS:`);
-  console.log(`  Profitable coins:  ${winners.length} / ${results.length}  (${(winners.length / results.length * 100).toFixed(0)}%)`);
-  console.log(`  Total P&L (all ${results.length} coins, $${TRADE_SIZE}/trade, ${DAYS} days):  ${totalAll >= 0 ? '+' : ''}$${totalAll.toFixed(2)}`);
-  console.log(`  Winners P&L only:  +$${totalWin.toFixed(2)}`);
+  console.log(`  Profitable coins (baseline):    ${winners.length} / ${results.length}  (${(winners.length / results.length * 100).toFixed(0)}%)`);
+  console.log(`  Profitable coins (switch 1.5%): ${winnersNew.length} / ${resultsNew.length}  (${(winnersNew.length / resultsNew.length * 100).toFixed(0)}%)`);
+  console.log(`  Total P&L baseline:             ${totalAll >= 0 ? '+' : ''}$${totalAll.toFixed(2)}`);
+  console.log(`  Total P&L switch filter 1.5%:   ${totalNew >= 0 ? '+' : ''}$${totalNew.toFixed(2)}  (${totalNew - totalAll >= 0 ? '+' : ''}$${(totalNew - totalAll).toFixed(2)} vs baseline)`);
+  console.log(`  Winners P&L only (baseline):    +$${totalWin.toFixed(2)}`);
 
   console.log(`\n  SCALE-UP — all ${results.length} coins — ${DAYS} days ≈ 1 month:`);
   console.log(`  Trade$/pos   Monthly P&L`);
