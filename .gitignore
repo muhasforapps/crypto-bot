@@ -5,4 +5,7 @@ paper-state.json
 forex-state.json
 grid-state.json
 bot-state.json
+hyro-state.json
+hyro-trades.csv
+trades.csv
 *.log
