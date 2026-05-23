@@ -67,6 +67,9 @@ const DAILY_DD_FLAT   = 0.045;   // flatten everything + halt for the day
 const MAX_LOSS_LIMIT  = 0.10;    // hard breach
 const MAX_LOSS_FLAT   = 0.09;    // flatten + stop bot entirely
 const PROFIT_TARGET   = 0.10;    // phase-1 target → halt + notify
+// Profit lock — stop the bot the moment realized+unrealized profit reaches this
+// dollar amount. Protects gains from being given back. Configurable via env.
+const PROFIT_LOCK_USD = parseFloat(process.env.HYRO_PROFIT_LOCK_USD) || 150;
 
 // Scan timing
 const SCAN_MS         = 15 * 60 * 1000;   // full grid scan
@@ -270,6 +273,7 @@ async function checkRisk(state) {
   if (totalPnlPct <= -MAX_LOSS_FLAT)        action = 'flatten-stop';
   else if (dailyDDPct >= DAILY_DD_FLAT)     action = 'flatten-day';
   else if (dailyDDPct >= DAILY_DD_HALT)     action = 'halt';
+  else if (totalPnl >= PROFIT_LOCK_USD)     action = 'profit-lock';   // lock gains BEFORE risking them
   else if (totalPnlPct >= PROFIT_TARGET)    action = 'target';
 
   return { equity, dailyDD, dailyDDPct, totalPnl, totalPnlPct, action };
@@ -423,6 +427,11 @@ async function riskTick() {
   } else if (action === 'halt' && !halted) {
     halted = true;
     await tg(`⚠️ <b>NEW ENTRIES PAUSED</b> — daily drawdown ${(dailyDDPct*100).toFixed(2)}% (4% buffer). Existing positions keep their stops.`);
+  } else if (action === 'profit-lock' && !stopped) {
+    const locked = risk.totalPnl;
+    await flattenAll(state, `PROFIT LOCK reached — +$${locked.toFixed(2)} (lock at $${PROFIT_LOCK_USD})`);
+    stopped = true;
+    await tg(`💰 <b>PROFIT LOCKED</b> +$${locked.toFixed(2)}!\nBot stopped to protect the gain. Restart manually (or raise <code>HYRO_PROFIT_LOCK_USD</code>) when you want to keep trading.`);
   } else if (action === 'target' && !stopped) {
     await flattenAll(state, `PROFIT TARGET +${(totalPnlPct*100).toFixed(2)}% reached`);
     stopped = true;
@@ -504,6 +513,7 @@ async function main() {
   log('  HyroTrader Challenge Grid Bot — LIVE');
   log(`  Initial: $${INITIAL_BALANCE}  |  $${TRADE_NOTIONAL}/pos  |  ${LEVERAGE}x  |  ${MAX_COINS} coins`);
   log(`  SL:${(STOP_LOSS_PCT*100)}%  |  DailyDD halt:${DAILY_DD_HALT*100}% flat:${DAILY_DD_FLAT*100}%  |  MaxLoss flat:${MAX_LOSS_FLAT*100}%  |  Target:+${PROFIT_TARGET*100}%`);
+  log(`  💰 Profit lock: +$${PROFIT_LOCK_USD}  (override via HYRO_PROFIT_LOCK_USD env)`);
   log('══════════════════════════════════════════════════');
 
   if (!process.env.HYRO_API_KEY || !process.env.HYRO_API_SECRET) {
@@ -519,7 +529,8 @@ async function main() {
       `🤖 <b>HyroTrader Bot STARTED</b>\n\n` +
       `💵 Equity: $${eq.toFixed(2)}  (initial $${INITIAL_BALANCE})\n` +
       `📦 $${TRADE_NOTIONAL}/pos | ${LEVERAGE}x | ${MAX_COINS} coins | 3% SL\n` +
-      `🛡 Daily DD halt 4% / flatten 4.5% | Max-loss flatten 9% | Target +10%`
+      `🛡 Daily DD halt 4% / flatten 4.5% | Max-loss flatten 9% | Target +10%\n` +
+      `💰 <b>Profit lock: +$${PROFIT_LOCK_USD}</b> (auto-stop when reached)`
     );
   } catch (e) {
     log(`  ✖ Connection failed: ${e.message}`);
