@@ -233,12 +233,14 @@ function logTrade({ symbol, type, direction, entry, exit, pnl }) {
 }
 
 // ── Telegram ──────────────────────────────────────────────────────────────────
+const TG_TAG = '💰 [HYRO] ';   // prefix so messages are distinct from the paper bot
 async function tg(msg) {
   const token = process.env.TELEGRAM_TOKEN, chat = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chat) { console.log('[TG]', msg.replace(/<[^>]+>/g, '')); return; }
+  const tagged = TG_TAG + msg;
+  if (!token || !chat) { console.log('[TG]', tagged.replace(/<[^>]+>/g, '')); return; }
   try {
     await axios.post(`https://api.telegram.org/bot${token}/sendMessage`,
-      { chat_id: chat, text: msg, parse_mode: 'HTML' }, { timeout: 8000 });
+      { chat_id: chat, text: tagged, parse_mode: 'HTML' }, { timeout: 8000 });
   } catch (_) {}
 }
 
@@ -391,6 +393,9 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
 let halted = false;       // halted for the day (daily DD)
 let stopped = false;      // bot fully stopped (max loss or target)
 
+let lastHeartbeatAt = 0;
+const HEARTBEAT_LOG_MS = 5 * 60 * 1000;   // throttle the routine 💓 log to once per 5 min
+
 async function riskTick() {
   if (stopped) return;
   const state = loadState();
@@ -398,24 +403,32 @@ async function riskTick() {
   try { risk = await checkRisk(state); } catch (e) { log(`  ! risk check: ${e.message}`); return; }
 
   const { equity, dailyDDPct, totalPnlPct, action } = risk;
-  log(`  💓 equity:$${equity.toFixed(2)}  dayDD:${(dailyDDPct*100).toFixed(2)}%  total:${(totalPnlPct*100).toFixed(2)}%  [${action}]`);
+  // Always log on action != 'ok' (state-change events). Otherwise throttle to 5 min.
+  const now = Date.now();
+  if (action !== 'ok' || (now - lastHeartbeatAt) >= HEARTBEAT_LOG_MS) {
+    log(`  💓 equity:$${equity.toFixed(2)}  dayDD:${(dailyDDPct*100).toFixed(2)}%  total:${(totalPnlPct*100).toFixed(2)}%  [${action}]`);
+    lastHeartbeatAt = now;
+  }
 
-  if (action === 'flatten-stop') {
+  // Each branch only fires ONCE per state transition — flag prevents the
+  // 60s-loop from re-flattening + spamming Telegram while dailyDD stays high.
+  if (action === 'flatten-stop' && !stopped) {
     await flattenAll(state, `MAX LOSS guard — account ${(totalPnlPct*100).toFixed(2)}% (limit -10%)`);
     stopped = true;
     await tg(`⛔ <b>BOT STOPPED</b> — max-loss buffer hit at ${(totalPnlPct*100).toFixed(2)}%. No more trades. Manual restart required.`);
-  } else if (action === 'flatten-day') {
+  } else if (action === 'flatten-day' && !halted) {
     await flattenAll(state, `DAILY DRAWDOWN guard — ${(dailyDDPct*100).toFixed(2)}% (limit 5%)`);
     halted = true;
     await tg(`🟠 <b>HALTED FOR TODAY</b> — daily drawdown ${(dailyDDPct*100).toFixed(2)}%. Trading resumes next day.`);
-  } else if (action === 'halt') {
-    if (!halted) { halted = true; await tg(`⚠️ <b>NEW ENTRIES PAUSED</b> — daily drawdown ${(dailyDDPct*100).toFixed(2)}% (4% buffer). Existing positions keep their stops.`); }
-  } else if (action === 'target') {
+  } else if (action === 'halt' && !halted) {
+    halted = true;
+    await tg(`⚠️ <b>NEW ENTRIES PAUSED</b> — daily drawdown ${(dailyDDPct*100).toFixed(2)}% (4% buffer). Existing positions keep their stops.`);
+  } else if (action === 'target' && !stopped) {
     await flattenAll(state, `PROFIT TARGET +${(totalPnlPct*100).toFixed(2)}% reached`);
     stopped = true;
     await tg(`🎯 <b>PROFIT TARGET HIT</b> +${(totalPnlPct*100).toFixed(2)}%! Flattened & stopped — move to the next phase, then restart the bot.`);
   } else if (action === 'ok' && halted) {
-    // recovered (e.g. new day reset) → resume
+    // dailyDD recovered (usually because UTC day rolled over → fresh peak) → resume
     halted = false;
     await tg(`✅ <b>RESUMED</b> — daily drawdown back to ${(dailyDDPct*100).toFixed(2)}%. New entries enabled.`);
   }
