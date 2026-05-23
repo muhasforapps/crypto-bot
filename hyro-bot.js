@@ -433,8 +433,12 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
 }
 
 // ── Lightweight risk monitor (runs every RISK_MS) ───────────────────────────────
-let halted = false;       // halted for the day (daily DD)
-let stopped = false;      // bot fully stopped (max loss or target)
+let halted = false;       // halted for the day (daily DD guard) — auto-resumes next UTC day
+let stopped = false;      // bot fully stopped (max loss / target / profit lock) — manual restart
+// Kill-switch: when HYRO_PAUSED=1 in env, the bot starts up but refuses to open
+// any new positions. Existing positions on Bybit keep their attached stops, so
+// they're protected. Manual unpause = remove the env var and redeploy.
+const PAUSED = ['1', 'true', 'yes'].includes(String(process.env.HYRO_PAUSED || '').toLowerCase());
 
 let lastHeartbeatAt = 0;
 const HEARTBEAT_LOG_MS = 5 * 60 * 1000;   // throttle the routine 💓 log to once per 5 min
@@ -492,7 +496,7 @@ async function scan() {
 
   let risk;
   try { risk = await checkRisk(state); } catch (e) { log(`  ! scan risk: ${e.message}`); saveState(state); return; }
-  const allowNewEntries = !halted && !stopped && risk.action === 'ok';
+  const allowNewEntries = !PAUSED && !halted && !stopped && risk.action === 'ok';
 
   // Rotate out stale coins (no positions + idle)
   for (const [sym, s] of Object.entries(state.coins)) {
@@ -554,6 +558,7 @@ async function main() {
   log(`  SL:${(STOP_LOSS_PCT*100)}%  |  DailyDD halt:${DAILY_DD_HALT*100}% flat:${DAILY_DD_FLAT*100}%  |  MaxLoss flat:${MAX_LOSS_FLAT*100}%  |  Target:+${PROFIT_TARGET*100}%`);
   log(`  Entry filters — minEMA-sep:${(MIN_EMA_SEP*100).toFixed(2)}%  minTrendScore:${MIN_TREND_SCORE}  RSI:${RSI_SHORT_MIN}-${RSI_LONG_MAX}  SL-cooldown:${SL_COOLDOWN_MS/60000}min`);
   log(`  💰 Profit lock: +$${PROFIT_LOCK_USD}  (override via HYRO_PROFIT_LOCK_USD env)`);
+  if (PAUSED) log(`  ⏸  PAUSED — HYRO_PAUSED env is set. No new entries will open. Existing positions keep their stops.`);
   log('══════════════════════════════════════════════════');
 
   if (!process.env.HYRO_API_KEY || !process.env.HYRO_API_SECRET) {
@@ -566,11 +571,12 @@ async function main() {
     const eq = await getEquity();
     log(`  ✓ Connected. Equity: $${eq.toFixed(2)}`);
     await tg(
-      `🤖 <b>HyroTrader Bot STARTED</b>\n\n` +
+      `🤖 <b>HyroTrader Bot STARTED</b>${PAUSED ? '  ⏸ <b>(PAUSED — no new trades)</b>' : ''}\n\n` +
       `💵 Equity: $${eq.toFixed(2)}  (initial $${INITIAL_BALANCE})\n` +
       `📦 $${TRADE_NOTIONAL}/pos | ${LEVERAGE}x | ${MAX_COINS} coins | 3% SL\n` +
       `🛡 Daily DD halt 4% / flatten 4.5% | Max-loss flatten 9% | Target +10%\n` +
-      `💰 <b>Profit lock: +$${PROFIT_LOCK_USD}</b> (auto-stop when reached)`
+      `💰 <b>Profit lock: +$${PROFIT_LOCK_USD}</b> (auto-stop when reached)` +
+      (PAUSED ? `\n\n⏸ <b>Paused via HYRO_PAUSED.</b> Existing positions keep their stops on the exchange. Remove the env var and redeploy to resume.` : '')
     );
   } catch (e) {
     log(`  ✖ Connection failed: ${e.message}`);
