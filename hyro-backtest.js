@@ -20,16 +20,20 @@ const axios = require('axios');
 // ── Shared config ─────────────────────────────────────────────────────────────
 const INITIAL_BALANCE = 10000;
 const TRADE_NOTIONAL  = 500;
-const MAX_POSITIONS   = 4;
+const MAX_POSITIONS   = 2;       // ↓ matches new bot default
 const MAX_COINS       = 4;
 const GRID_STEP       = 0.005;
 const GRID_BIG        = 0.01;
 const BIG_MOVE_PCT    = 10;
 const EMA_FAST        = 20;
 const EMA_SLOW        = 50;
-const MIN_EMA_SEP     = 0.004;
+const MIN_EMA_SEP     = 0.008;   // ↑ stricter
 const SWITCH_COOL     = 16;
-const MIN_TREND_PCT   = 0.55;
+const MIN_TREND_PCT   = 0.72;    // ↑ stricter
+const RSI_PERIOD      = 14;
+const RSI_LONG_MAX    = 70;
+const RSI_SHORT_MIN   = 30;
+const SL_COOLDOWN_CANDLES = 2;   // 30 min = 2 × 15min candles
 const DAILY_DD_HALT   = 0.04;
 const DAILY_DD_FLAT   = 0.045;
 const MAX_LOSS_FLAT   = 0.09;
@@ -59,6 +63,28 @@ function calcEMA(values, period) {
   let ema = seed;
   for (let i = period; i < values.length; i++) { ema = values[i] * k + ema * (1 - k); result.push(ema); }
   return result;
+}
+
+// Rolling Wilder RSI array — RSI[i] uses closes[0..i].
+function calcRSIArray(closes, period = RSI_PERIOD) {
+  const out = new Array(closes.length).fill(50);
+  if (closes.length < period + 1) return out;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gains += d; else losses -= d;
+  }
+  let avgG = gains / period, avgL = losses / period;
+  out[period] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    avgG = (avgG * (period - 1) + g) / period;
+    avgL = (avgL * (period - 1) + l) / period;
+    out[i] = avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+  }
+  return out;
 }
 
 async function fetchTickers() {
@@ -99,11 +125,12 @@ function runPortfolio(coinSeries, change24hMap, cfg) {
   for (const sym of coins) for (const c of coinSeries[sym]) tsSet.add(c.ts);
   const timeline = [...tsSet].sort((a, b) => a - b);
 
-  const ema20 = {}, ema50 = {}, idxByTs = {};
+  const ema20 = {}, ema50 = {}, rsiArr = {}, idxByTs = {};
   for (const sym of coins) {
     const closes = coinSeries[sym].map(c => c.close);
-    ema20[sym] = calcEMA(closes, EMA_FAST);
-    ema50[sym] = calcEMA(closes, EMA_SLOW);
+    ema20[sym]  = calcEMA(closes, EMA_FAST);
+    ema50[sym]  = calcEMA(closes, EMA_SLOW);
+    rsiArr[sym] = calcRSIArray(closes, RSI_PERIOD);
     idxByTs[sym] = new Map(coinSeries[sym].map((c, i) => [c.ts, i]));
   }
 
@@ -208,6 +235,7 @@ function runPortfolio(coinSeries, change24hMap, cfg) {
             realizedPnl += pnl;
             trades.push({ ts, sym, type: 'sl', pnl });
             a.positions.splice(pi, 1);
+            a.cooldownUntilIdx = i + SL_COOLDOWN_CANDLES;   // block re-entry for N candles
             continue;
           }
           const tpHit = p.mode === 'long' ? c.high >= p.tp : c.low <= p.tp;
@@ -244,6 +272,12 @@ function runPortfolio(coinSeries, change24hMap, cfg) {
       const s = active[sym];
       if (s.positions.length >= MAX_POSITIONS) continue;
       if (emaSep < MIN_EMA_SEP) continue;
+      // SL cooldown — block re-entry for N candles after a stop-out
+      if (s.cooldownUntilIdx && i < s.cooldownUntilIdx) continue;
+      // RSI gate — don't long overbought, don't short oversold
+      const rsi = rsiArr[sym][i];
+      if (s.mode === 'long'  && rsi > RSI_LONG_MAX)  continue;
+      if (s.mode === 'short' && rsi < RSI_SHORT_MIN) continue;
       const lastEntry = s.positions.length ? s.positions[s.positions.length - 1].entry : null;
       const dist = lastEntry ? Math.abs(c.close - lastEntry) / lastEntry : 1;
       if (dist < gridStep) continue;

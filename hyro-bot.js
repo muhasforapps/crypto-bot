@@ -39,26 +39,30 @@ const http   = require('http');
 // ── Config ──────────────────────────────────────────────────────────────────
 const INITIAL_BALANCE = parseFloat(process.env.HYRO_INITIAL_BALANCE) || 10000;
 
-// Position sizing (MODERATE)
-const TRADE_NOTIONAL  = 500;     // USDT notional per grid position
-const LEVERAGE        = 3;
-const MAX_POSITIONS   = 4;       // grid levels per coin
-const MAX_COINS       = 4;
+// Position sizing (MODERATE) — env-tunable so we can dial risk without redeploys
+const TRADE_NOTIONAL  = parseFloat(process.env.HYRO_TRADE_NOTIONAL)   || 500;
+const LEVERAGE        = parseFloat(process.env.HYRO_LEVERAGE)         || 3;
+const MAX_POSITIONS   = parseInt  (process.env.HYRO_MAX_POSITIONS)    || 2;     // ↓ 4→2 (less stacking per coin)
+const MAX_COINS       = parseInt  (process.env.HYRO_MAX_COINS)        || 4;
 
 // Grid / TP
-const TP_PCT          = 0.0067;  // 0.67% TP for normal coins
-const TP_BIG          = 0.05;    // 5% TP for big movers (>10% 24h)
-const GRID_STEP       = 0.005;   // 0.5% min gap between grid entries
-const GRID_BIG        = 0.01;    // 1% gap for big movers
+const TP_PCT          = parseFloat(process.env.HYRO_TP_PCT)           || 0.0067;
+const TP_BIG          = parseFloat(process.env.HYRO_TP_BIG)           || 0.05;
+const GRID_STEP       = 0.005;
+const GRID_BIG        = 0.01;
 const BIG_MOVE_PCT    = 10;
-const STOP_LOSS_PCT   = 0.03;    // 3% hard SL on every position (REQUIRED)
+const STOP_LOSS_PCT   = parseFloat(process.env.HYRO_STOP_LOSS_PCT)    || 0.03;
 
-// EMA / trend
+// EMA / trend — STRICTER FILTERS to cut bad entries (backtest showed 174 SLs vs 99 TPs)
 const EMA_FAST        = 20;
 const EMA_SLOW        = 50;
-const MIN_EMA_SEP     = 0.004;
+const MIN_EMA_SEP     = parseFloat(process.env.HYRO_MIN_EMA_SEP)      || 0.008;   // ↑ 0.4%→0.8% (stronger trend needed)
+const MIN_TREND_SCORE = parseFloat(process.env.HYRO_MIN_TREND_SCORE)  || 0.72;    // ↑ 0.62→0.72 (only clean trends)
+const RSI_PERIOD      = 14;
+const RSI_LONG_MAX    = parseFloat(process.env.HYRO_RSI_LONG_MAX)     || 70;      // skip long entry if RSI > 70 (overbought)
+const RSI_SHORT_MIN   = parseFloat(process.env.HYRO_RSI_SHORT_MIN)    || 30;      // skip short entry if RSI < 30 (oversold)
+const SL_COOLDOWN_MS  = (parseFloat(process.env.HYRO_SL_COOLDOWN_MIN) || 30) * 60_000;  // wait N min after SL before re-entering same coin
 const SWITCH_COOL_MS  = 4 * 60 * 60 * 1000;
-const MIN_TREND_SCORE = 0.62;
 
 // Challenge risk thresholds (fractions of INITIAL_BALANCE)
 const DAILY_DD_LIMIT  = 0.05;    // hard breach
@@ -206,6 +210,27 @@ function calcEMA(values, period) {
   return res;
 }
 
+// Classic Wilder RSI on closing prices. Returns the latest value (0-100).
+function calcRSI(closes, period = RSI_PERIOD) {
+  if (closes.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff; else losses -= diff;
+  }
+  let avgG = gains / period, avgL = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const g = diff > 0 ? diff : 0;
+    const l = diff < 0 ? -diff : 0;
+    avgG = (avgG * (period - 1) + g) / period;
+    avgL = (avgL * (period - 1) + l) / period;
+  }
+  if (avgL === 0) return 100;
+  const rs = avgG / avgL;
+  return 100 - 100 / (1 + rs);
+}
+
 function calcTrendScore(candles) {
   if (candles.length < EMA_SLOW + 10) return 0;
   const closes = candles.map(c => c.close);
@@ -342,9 +367,12 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
   try { livePositions = await getPosition(sym); } catch { livePositions = null; }
   const liveSize = livePositions ? livePositions.reduce((a, p) => a + parseFloat(p.size), 0) : null;
   if (liveSize === 0 && s.positions.length > 0) {
-    // Exchange flat (TP or SL filled everything) — reset our tracking
-    log(`  ⟲ ${sym} exchange flat — clearing ${s.positions.length} tracked entries`);
+    // Exchange flat (TP or SL filled everything). We can't easily tell SL vs TP
+    // without order history, so be conservative and apply the SL cooldown to all
+    // unexpected close-outs — prevents re-entering a coin that just stopped out.
+    log(`  ⟲ ${sym} exchange flat — clearing ${s.positions.length} tracked entries  cooldown:${SL_COOLDOWN_MS/60000}min`);
     s.positions = [];
+    s.cooldownUntil = now + SL_COOLDOWN_MS;
     await cancelAll(sym);
   }
 
@@ -366,7 +394,18 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
   }
 
   // ── Open new grid level ─────────────────────────────────────────────────────
-  if (allowNewEntries && emaSep >= MIN_EMA_SEP && s.positions.length < MAX_POSITIONS) {
+  // Filters (all must pass): allowed → EMA sep strong → not in SL cooldown →
+  // RSI not extreme in the trade direction → room for another grid level.
+  const inCooldown   = s.cooldownUntil && now < s.cooldownUntil;
+  const rsi          = calcRSI(closes);
+  const rsiBlocksLong  = s.mode === 'long'  && rsi > RSI_LONG_MAX;
+  const rsiBlocksShort = s.mode === 'short' && rsi < RSI_SHORT_MIN;
+  if (inCooldown)      log(`  ⏸ ${sym} in SL cooldown ${Math.round((s.cooldownUntil-now)/60000)}min`);
+  if (rsiBlocksLong)   log(`  ⏸ ${sym} long blocked — RSI ${rsi.toFixed(0)} > ${RSI_LONG_MAX}`);
+  if (rsiBlocksShort)  log(`  ⏸ ${sym} short blocked — RSI ${rsi.toFixed(0)} < ${RSI_SHORT_MIN}`);
+
+  if (allowNewEntries && !inCooldown && !rsiBlocksLong && !rsiBlocksShort &&
+      emaSep >= MIN_EMA_SEP && s.positions.length < MAX_POSITIONS) {
     const lastEntry = s.positions.length ? s.positions[s.positions.length - 1].entry : null;
     const dist = lastEntry ? Math.abs(last.close - lastEntry) / lastEntry : 1;
     if (dist >= gridStep) {
@@ -386,7 +425,7 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
           `${s.mode === 'long' ? '🟢' : '🔴'} <b>${s.mode.toUpperCase()} ${sym}</b>${isBig ? ' 🔥' : ''}\n` +
           `Entry: <code>${price}</code>  Qty: ${qty}\n` +
           `🎯 TP: ${tp}  🛑 SL: ${sl} (3%)\n` +
-          `Pos: ${s.positions.length}/${MAX_POSITIONS}  |  EMA sep: ${(emaSep*100).toFixed(2)}%`
+          `Pos: ${s.positions.length}/${MAX_POSITIONS}  |  EMA sep: ${(emaSep*100).toFixed(2)}%  |  RSI: ${rsi.toFixed(0)}`
         );
       } catch (e) { log(`  ! entry ${sym}: ${e.message}`); }
     }
@@ -511,8 +550,9 @@ http.createServer((req, res) => {
 async function main() {
   log('══════════════════════════════════════════════════');
   log('  HyroTrader Challenge Grid Bot — LIVE');
-  log(`  Initial: $${INITIAL_BALANCE}  |  $${TRADE_NOTIONAL}/pos  |  ${LEVERAGE}x  |  ${MAX_COINS} coins`);
+  log(`  Initial: $${INITIAL_BALANCE}  |  $${TRADE_NOTIONAL}/pos  |  ${LEVERAGE}x  |  ${MAX_COINS} coins  |  ${MAX_POSITIONS} pos/coin`);
   log(`  SL:${(STOP_LOSS_PCT*100)}%  |  DailyDD halt:${DAILY_DD_HALT*100}% flat:${DAILY_DD_FLAT*100}%  |  MaxLoss flat:${MAX_LOSS_FLAT*100}%  |  Target:+${PROFIT_TARGET*100}%`);
+  log(`  Entry filters — minEMA-sep:${(MIN_EMA_SEP*100).toFixed(2)}%  minTrendScore:${MIN_TREND_SCORE}  RSI:${RSI_SHORT_MIN}-${RSI_LONG_MAX}  SL-cooldown:${SL_COOLDOWN_MS/60000}min`);
   log(`  💰 Profit lock: +$${PROFIT_LOCK_USD}  (override via HYRO_PROFIT_LOCK_USD env)`);
   log('══════════════════════════════════════════════════');
 
