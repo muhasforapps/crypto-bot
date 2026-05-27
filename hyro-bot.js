@@ -45,10 +45,10 @@ const LEVERAGE        = parseFloat(process.env.HYRO_LEVERAGE)         || 3;
 const MAX_POSITIONS   = parseInt  (process.env.HYRO_MAX_POSITIONS)    || 2;     // ↓ 4→2 (less stacking per coin)
 const MAX_COINS       = parseInt  (process.env.HYRO_MAX_COINS)        || 4;
 
-// Grid / TP
-const TP_PCT          = parseFloat(process.env.HYRO_TP_PCT)           || 0.0067;
+// Grid / TP  (1H timeframe — wider TP matches I-asym-5:3 backtest winner)
+const TP_PCT          = parseFloat(process.env.HYRO_TP_PCT)           || 0.05;
 const TP_BIG          = parseFloat(process.env.HYRO_TP_BIG)           || 0.05;
-const GRID_STEP       = 0.005;
+const GRID_STEP       = 0.010;   // 1H: wider grid spacing to avoid over-stacking
 const GRID_BIG        = 0.01;
 const BIG_MOVE_PCT    = 10;
 const STOP_LOSS_PCT   = parseFloat(process.env.HYRO_STOP_LOSS_PCT)    || 0.03;
@@ -61,7 +61,7 @@ const MIN_TREND_SCORE = parseFloat(process.env.HYRO_MIN_TREND_SCORE)  || 0.72;  
 const RSI_PERIOD      = 14;
 const RSI_LONG_MAX    = parseFloat(process.env.HYRO_RSI_LONG_MAX)     || 70;      // skip long entry if RSI > 70 (overbought)
 const RSI_SHORT_MIN   = parseFloat(process.env.HYRO_RSI_SHORT_MIN)    || 30;      // skip short entry if RSI < 30 (oversold)
-const SL_COOLDOWN_MS  = (parseFloat(process.env.HYRO_SL_COOLDOWN_MIN) || 30) * 60_000;  // wait N min after SL before re-entering same coin
+const SL_COOLDOWN_MS  = (parseFloat(process.env.HYRO_SL_COOLDOWN_MIN) || 120) * 60_000;  // 2h = 2 × 1H candles  // wait N min after SL before re-entering same coin
 const SWITCH_COOL_MS  = 4 * 60 * 60 * 1000;
 
 // Challenge risk thresholds (fractions of INITIAL_BALANCE)
@@ -75,12 +75,12 @@ const PROFIT_TARGET   = 0.10;    // phase-1 target → halt + notify
 // dollar amount. Protects gains from being given back. Configurable via env.
 const PROFIT_LOCK_USD = parseFloat(process.env.HYRO_PROFIT_LOCK_USD) || 150;
 
-// Scan timing
-const SCAN_MS         = 15 * 60 * 1000;   // full grid scan
+// Scan timing  (1H timeframe)
+const SCAN_MS         = 60 * 60 * 1000;   // full grid scan — once per hour
 const RISK_MS         = 60 * 1000;        // lightweight equity/risk check
 const MIN_VOL_USD     = 20_000_000;
 const MIN_CHANGE      = 1.5;
-const STALE_HOURS     = 8;
+const STALE_HOURS     = 24;
 
 const STATE_FILE      = './hyro-state.json';
 const TRADES_FILE     = './hyro-trades.csv';
@@ -194,7 +194,7 @@ async function fetchTickers() {
 }
 
 async function fetchCandles(symbol) {
-  const res = await api.get('/v5/market/kline', { params: { category: 'linear', symbol, interval: '15', limit: 100 } });
+  const res = await api.get('/v5/market/kline', { params: { category: 'linear', symbol, interval: '60', limit: 100 } });
   if (res.data.retCode !== 0) return [];
   return res.data.result.list.map(c => ({ ts: +c[0], high: +c[2], low: +c[3], close: +c[4] })).sort((a, b) => a.ts - b.ts);
 }
@@ -424,7 +424,7 @@ async function processCoin(sym, candles, state, change24h, allowNewEntries) {
         await tg(
           `${s.mode === 'long' ? '🟢' : '🔴'} <b>${s.mode.toUpperCase()} ${sym}</b>${isBig ? ' 🔥' : ''}\n` +
           `Entry: <code>${price}</code>  Qty: ${qty}\n` +
-          `🎯 TP: ${tp}  🛑 SL: ${sl} (3%)\n` +
+          `🎯 TP: ${tp}  🛑 SL: ${sl} (${(STOP_LOSS_PCT*100).toFixed(0)}%)\n` +
           `Pos: ${s.positions.length}/${MAX_POSITIONS}  |  EMA sep: ${(emaSep*100).toFixed(2)}%  |  RSI: ${rsi.toFixed(0)}`
         );
       } catch (e) { log(`  ! entry ${sym}: ${e.message}`); }
@@ -553,9 +553,9 @@ http.createServer((req, res) => {
 // ── Entry ─────────────────────────────────────────────────────────────────────
 async function main() {
   log('══════════════════════════════════════════════════');
-  log('  HyroTrader Challenge Grid Bot — LIVE');
+  log('  HyroTrader Challenge Grid Bot — LIVE  (1H candles)');
   log(`  Initial: $${INITIAL_BALANCE}  |  $${TRADE_NOTIONAL}/pos  |  ${LEVERAGE}x  |  ${MAX_COINS} coins  |  ${MAX_POSITIONS} pos/coin`);
-  log(`  SL:${(STOP_LOSS_PCT*100)}%  |  DailyDD halt:${DAILY_DD_HALT*100}% flat:${DAILY_DD_FLAT*100}%  |  MaxLoss flat:${MAX_LOSS_FLAT*100}%  |  Target:+${PROFIT_TARGET*100}%`);
+  log(`  TP:${(TP_PCT*100).toFixed(2)}%  SL:${(STOP_LOSS_PCT*100)}%  |  DailyDD halt:${DAILY_DD_HALT*100}% flat:${DAILY_DD_FLAT*100}%  |  MaxLoss flat:${MAX_LOSS_FLAT*100}%  |  Target:+${PROFIT_TARGET*100}%`);
   log(`  Entry filters — minEMA-sep:${(MIN_EMA_SEP*100).toFixed(2)}%  minTrendScore:${MIN_TREND_SCORE}  RSI:${RSI_SHORT_MIN}-${RSI_LONG_MAX}  SL-cooldown:${SL_COOLDOWN_MS/60000}min`);
   log(`  💰 Profit lock: +$${PROFIT_LOCK_USD}  (override via HYRO_PROFIT_LOCK_USD env)`);
   if (PAUSED) log(`  ⏸  PAUSED — HYRO_PAUSED env is set. No new entries will open. Existing positions keep their stops.`);
@@ -573,7 +573,7 @@ async function main() {
     await tg(
       `🤖 <b>HyroTrader Bot STARTED</b>${PAUSED ? '  ⏸ <b>(PAUSED — no new trades)</b>' : ''}\n\n` +
       `💵 Equity: $${eq.toFixed(2)}  (initial $${INITIAL_BALANCE})\n` +
-      `📦 $${TRADE_NOTIONAL}/pos | ${LEVERAGE}x | ${MAX_COINS} coins | 3% SL\n` +
+      `📦 $${TRADE_NOTIONAL}/pos | ${LEVERAGE}x | ${MAX_COINS} coins | TP:${(TP_PCT*100).toFixed(0)}% SL:${(STOP_LOSS_PCT*100).toFixed(0)}% | 1H\n` +
       `🛡 Daily DD halt 4% / flatten 4.5% | Max-loss flatten 9% | Target +10%\n` +
       `💰 <b>Profit lock: +$${PROFIT_LOCK_USD}</b> (auto-stop when reached)` +
       (PAUSED ? `\n\n⏸ <b>Paused via HYRO_PAUSED.</b> Existing positions keep their stops on the exchange. Remove the env var and redeploy to resume.` : '')
