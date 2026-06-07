@@ -563,7 +563,7 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
 
     state[sym] = {
       mode: initialMode, positions: [], closedPnl: 0,
-      trades: 0, wins: 0, lastSwitch: 0,
+      trades: 0, wins: 0, lastSwitch: pumpedToday ? Date.now() : 0,
       startedAt: new Date().toISOString(),
       lastActivityAt: new Date().toISOString(),
       trendScore: +score.toFixed(2),
