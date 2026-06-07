@@ -8,9 +8,10 @@
  */
 
 require('dotenv').config();
-const axios = require('axios');
-const fs    = require('fs');
-const http  = require('http');
+const axios   = require('axios');
+const fs      = require('fs');
+const http    = require('http');
+const crypto  = require('crypto');
 
 // Keep-alive HTTP server so Render doesn't spin down the service
 http.createServer((req, res) => {
@@ -21,6 +22,8 @@ http.createServer((req, res) => {
   res.end(`Altcoin Paper Bot running\nClosed P&L: +$${total.toFixed(2)}\nTracking: ${coins}`);
 }).listen(process.env.PORT || 3000, () => {
   log(`Health server on port ${process.env.PORT || 3000}`);
+  if (LIVE_TRADING) log('🔴 LIVE TRADING — real Bybit orders will be placed');
+  else log('📝 Paper mode — set LIVE_TRADING=true in .env to go live');
 });
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -54,6 +57,11 @@ const STATE_FILE     = './paper-state.json';
 const TRADES_FILE    = './trades.csv';
 const BASE           = 'https://api.bybit.com';
 const HEADERS        = { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' };
+
+// Live trading — set LIVE_TRADING=true in .env to place real orders
+const LIVE_TRADING = process.env.LIVE_TRADING === 'true'
+  && !!process.env.BYBIT_API_KEY && !!process.env.BYBIT_API_SECRET;
+const LEVERAGE     = parseInt(process.env.LEVERAGE || '1', 10);
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log   = (...a) => console.log(new Date().toISOString().slice(0,19).replace('T',' '), ...a);
@@ -384,6 +392,97 @@ async function fetchShortMetrics(symbol) {
   return m;
 }
 
+// ── Live trading helpers ──────────────────────────────────────────────────────
+async function bybitAuth(method, endpoint, params = {}) {
+  const key    = process.env.BYBIT_API_KEY;
+  const secret = process.env.BYBIT_API_SECRET;
+  const ts     = Date.now().toString();
+  const recv   = '5000';
+
+  let toSign, cfg;
+  if (method === 'GET') {
+    const qs = new URLSearchParams(params).toString();
+    toSign   = ts + key + recv + qs;
+    cfg      = { method: 'GET', url: BASE + endpoint, params, timeout: 10000 };
+  } else {
+    const body = JSON.stringify(params);
+    toSign     = ts + key + recv + body;
+    cfg        = { method: 'POST', url: BASE + endpoint, data: params, timeout: 10000 };
+  }
+
+  const sig = crypto.createHmac('sha256', secret).update(toSign).digest('hex');
+  cfg.headers = {
+    ...HEADERS,
+    'X-BAPI-API-KEY':       key,
+    'X-BAPI-TIMESTAMP':     ts,
+    'X-BAPI-SIGN':          sig,
+    'X-BAPI-RECV-WINDOW':   recv,
+  };
+
+  const res = await axios(cfg);
+  if (res.data.retCode !== 0) throw new Error(`Bybit ${res.data.retCode}: ${res.data.retMsg}`);
+  return res.data.result;
+}
+
+const instrumentCache = {};
+async function getInstrument(symbol) {
+  if (instrumentCache[symbol]) return instrumentCache[symbol];
+  const res = await axios.get(
+    `${BASE}/v5/market/instruments-info?category=linear&symbol=${symbol}`,
+    { timeout: 8000, headers: HEADERS });
+  const info = res.data.result.list[0];
+  instrumentCache[symbol] = {
+    qtyStep: parseFloat(info.lotSizeFilter.qtyStep),
+    minQty:  parseFloat(info.lotSizeFilter.minOrderQty),
+  };
+  return instrumentCache[symbol];
+}
+
+function roundQty(rawQty, inst) {
+  const steps = Math.floor(rawQty / inst.qtyStep);
+  return +(Math.max(steps * inst.qtyStep, inst.minQty)).toFixed(8);
+}
+
+async function liveOpen(symbol, mode, tpPrice) {
+  const inst  = await getInstrument(symbol);
+  const price = (await fetchCandles(symbol)).at(-1).close;
+  const qty   = roundQty(TRADE_SIZE / price, inst);
+  const side  = mode === 'long' ? 'Buy' : 'Sell';
+
+  // Set leverage (ignore if already set)
+  try {
+    await bybitAuth('POST', '/v5/position/set-leverage', {
+      category: 'linear', symbol,
+      buyLeverage: String(LEVERAGE), sellLeverage: String(LEVERAGE),
+    });
+  } catch (_) {}
+
+  // Place market order
+  await bybitAuth('POST', '/v5/order/create', {
+    category: 'linear', symbol, side,
+    orderType: 'Market', qty: String(qty), positionIdx: 0,
+  });
+
+  // Set TP on position
+  await sleep(600);
+  try {
+    await bybitAuth('POST', '/v5/position/trading-stop', {
+      category: 'linear', symbol,
+      takeProfit: String(tpPrice), positionIdx: 0,
+    });
+  } catch (e) { log(`  ! TP set ${symbol}: ${e.message}`); }
+
+  return qty;
+}
+
+async function liveGetSize(symbol) {
+  try {
+    const res = await bybitAuth('GET', '/v5/position/list', { category: 'linear', symbol });
+    const pos = (res.list || []).find(p => p.symbol === symbol);
+    return pos ? parseFloat(pos.size) : 0;
+  } catch { return -1; }
+}
+
 // Gate: returns {safe, vetoes[], warnings[], line} — call before any new SHORT entry
 function shortGate(m) {
   const vetoes = [], warnings = [];
@@ -580,21 +679,29 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
       `24H change: ${change24h>=0?'+':''}${change24h.toFixed(1)}%  |  Trend score: ${(score*100).toFixed(0)}/100\n` +
       (gate.line ? `${gate.line}\n` : '') +
       `🎯 TP: ${(tpPct*100).toFixed(2)}%  |  Grid: ${(gridStep*100).toFixed(1)}%\n` +
-      `$${TRADE_SIZE}/position  max ${MAX_POSITIONS} positions${warnLine}\n<i>Paper trade</i>`
+      `$${TRADE_SIZE}/position  max ${MAX_POSITIONS} positions${warnLine}\n<i>${LIVE_TRADING ? '💸 LIVE trade' : 'Paper trade'}</i>`
     );
   }
 
   const s = state[sym];
 
   // ── Check TPs ─────────────────────────────────────────────────────────────
+  // In live mode: also detect if Bybit already closed the position (exchange-side TP)
+  let liveSize = -1;
+  if (LIVE_TRADING && s.positions.length > 0) {
+    liveSize = await liveGetSize(sym);
+  }
+
   for (let pi = s.positions.length - 1; pi >= 0; pi--) {
     const pos = s.positions[pi];
-    const hit = pos.mode === 'long' ? last.high >= pos.tp : last.low <= pos.tp;
-    if (!hit) continue;
+    const priceHit  = pos.mode === 'long' ? last.high >= pos.tp : last.low <= pos.tp;
+    const exchangeHit = LIVE_TRADING && liveSize === 0;
+    if (!priceHit && !exchangeHit) continue;
 
+    const exitPrice = exchangeHit && !priceHit ? pos.tp : pos.tp;
     const pnl = pos.mode === 'long'
-      ? (pos.tp - pos.entry) / pos.entry * TRADE_SIZE
-      : (pos.entry - pos.tp) / pos.entry * TRADE_SIZE;
+      ? (exitPrice - pos.entry) / pos.entry * TRADE_SIZE
+      : (pos.entry - exitPrice) / pos.entry * TRADE_SIZE;
 
     s.closedPnl += pnl;
     s.trades++;
@@ -602,11 +709,12 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
     s.positions.splice(pi, 1);
     s.lastActivityAt = new Date().toISOString();
 
-    logTrade({ symbol: sym, type: 'tp', direction: pos.mode, entry: pos.entry, exit: pos.tp, pnl, coinTotalPnl: s.closedPnl });
-    log(`  ✅ TP  ${sym}  ${pos.mode}  entry:${pos.entry}  tp:${pos.tp}  +$${pnl.toFixed(2)}`);
+    const liveTag = LIVE_TRADING ? ' 💸' : '';
+    logTrade({ symbol: sym, type: 'tp', direction: pos.mode, entry: pos.entry, exit: exitPrice, pnl, coinTotalPnl: s.closedPnl });
+    log(`  ✅ TP  ${sym}  ${pos.mode}  entry:${pos.entry}  tp:${exitPrice}  +$${pnl.toFixed(2)}`);
     await tg(
-      `✅ <b>TP HIT — ${pos.mode.toUpperCase()} ${sym}</b>\n` +
-      `Entry: ${pos.entry}  →  TP: ${pos.tp}\n` +
+      `✅ <b>TP HIT${liveTag} — ${pos.mode.toUpperCase()} ${sym}</b>\n` +
+      `Entry: ${pos.entry}  →  TP: ${exitPrice}\n` +
       `P&L: <b>+$${pnl.toFixed(2)}</b>\n` +
       `Total closed: <b>+$${s.closedPnl.toFixed(2)}</b>  (${s.trades} trades  WR:${(s.wins/s.trades*100).toFixed(0)}%)`
     );
@@ -640,17 +748,30 @@ async function processCoin(sym, candles, state, numActive, change24h = 0) {
         ? +(last.close * (1 + tpPct)).toFixed(dec)
         : +(last.close * (1 - tpPct)).toFixed(dec);
 
-      s.positions.push({ entry: last.close, tp, mode: s.mode, openedAt: new Date().toISOString() });
+      let liveQty = null;
+      if (LIVE_TRADING) {
+        try {
+          liveQty = await liveOpen(sym, s.mode, tp);
+          log(`  💸 LIVE ORDER ${sym} ${s.mode} qty:${liveQty} TP:${tp}`);
+        } catch (e) {
+          log(`  ! LIVE ORDER failed ${sym}: ${e.message}`);
+          await tg(`⚠️ <b>Live order FAILED — ${sym}</b>\n${e.message}\n<i>Skipping position</i>`);
+          return;
+        }
+      }
+
+      s.positions.push({ entry: last.close, tp, mode: s.mode, openedAt: new Date().toISOString(), qty: liveQty });
       s.lastActivityAt = new Date().toISOString();
 
       const emoji = s.mode === 'long' ? '🟢' : '🔴';
       const bigTag = isBigMover ? ' 🔥' : '';
+      const liveTag = LIVE_TRADING ? ' 💸 LIVE' : ' 📝 paper';
       log(`  ${emoji} OPEN ${sym}  ${s.mode}  entry:${last.close}  tp:${tp}  (${(tpPct*100).toFixed(2)}%${isBigMover?' BIG':''})`);
       await tg(
-        `${emoji} <b>${s.mode.toUpperCase()} — ${sym}</b>${bigTag}\n` +
+        `${emoji} <b>${s.mode.toUpperCase()} — ${sym}</b>${bigTag}${liveTag}\n` +
         `📍 Entry: <code>${last.close}</code>\n` +
         `🎯 TP:    <code>${tp}</code>  (+${(tpPct*100).toFixed(2)}%  est. +$${(TRADE_SIZE * tpPct).toFixed(2)})\n` +
-        `📦 $${TRADE_SIZE} paper  |  Pos: ${s.positions.length}/${MAX_POSITIONS}\n` +
+        `📦 $${TRADE_SIZE}${LIVE_TRADING ? ' REAL' : ' paper'}  |  Pos: ${s.positions.length}/${MAX_POSITIONS}\n` +
         `📊 EMA sep: ${(emaSep*100).toFixed(2)}%  |  Closed so far: +$${s.closedPnl.toFixed(2)}`
       );
     }
